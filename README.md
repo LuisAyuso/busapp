@@ -8,8 +8,9 @@ buses and trams, on Android. Built with [dfui](https://github.com/LuisAyuso/dfui
 - **Liniennetz**: the network as a graph. Tap a stop and the others arrange
   around it by travel time; the line chips turn lines on and off.
 - **Linien**: every line with its stops and the lines to change to.
-- **Karte**: a map of central Innsbruck with street names; drag to pan,
-  pinch to zoom.
+- **Karte**: a map of central Innsbruck with street names and the city
+  lines; drag to pan, pinch to zoom. Tap it or search an address to drop
+  a pin and list the closest stops.
 
 ## Install
 
@@ -39,7 +40,9 @@ API; refresh it with `cargo test --lib refresh_network -- --ignored`
 The map in `assets/innsbruck.json` is OpenStreetMap data (© OpenStreetMap
 contributors, ODbL) for 4×4 km around the centre, drawn with dfui's
 experimental `dfui-map`; refresh it with
-`cargo test --lib refresh_map -- --ignored`.
+`cargo test --lib refresh_map -- --ignored`. The addresses in
+`assets/addresses.json` come from the same source:
+`cargo test --lib refresh_addresses -- --ignored`.
 
 ## Releases
 

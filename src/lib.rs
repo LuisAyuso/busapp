@@ -173,8 +173,8 @@ impl App for Bus {
 struct Ui {
     query: String,
     stop: Option<Stop>,
-    /// Picking a destination for a trip from `stop`.
-    picking: bool,
+    /// Picking the other end of a trip from or to `stop`.
+    picking: Option<Pick>,
     to: Option<Stop>,
     screen: Screen,
     hidden: HashSet<String>,
@@ -184,8 +184,19 @@ struct Ui {
     dir: usize,
     /// Stop the network view is centred on, by snapshot index.
     center: Option<usize>,
-    /// Where the map was last tapped, in map metres.
-    tapped: Option<dfui::path::Point>,
+    pin: Option<map::Pin>,
+    /// Where the map centres, set by an address search.
+    focus: Option<dfui::path::Point>,
+    /// The address search over the map is open.
+    finding: bool,
+    address: String,
+}
+
+/// Which end of the trip `Ui::stop` is while picking the other.
+#[derive(Clone, Copy, PartialEq)]
+enum Pick {
+    From,
+    To,
 }
 
 /// Lines the network view shows until toggled.
@@ -203,7 +214,7 @@ impl Default for Ui {
         Ui {
             query: String::new(),
             stop: None,
-            picking: false,
+            picking: None,
             to: None,
             screen: Screen::default(),
             hidden,
@@ -211,7 +222,10 @@ impl Default for Ui {
             line: None,
             dir: 0,
             center: None,
-            tapped: None,
+            pin: None,
+            focus: None,
+            finding: false,
+            address: String::new(),
         }
     }
 }
@@ -241,13 +255,16 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                 Some(|u| u.to = None),
                 [connections(a, b)],
             ),
-            (Some(a), None) if ui.picking => page(
+            (Some(a), None) if ui.picking.is_some() => page(
                 h,
-                &format!("Von {} nach…", a.name),
-                Some(|u| u.picking = false),
-                search(&stops, &ui.query, h, |u, s| {
-                    u.picking = false;
-                    u.to = Some(s);
+                &match ui.picking {
+                    Some(Pick::From) => format!("Von {} nach…", a.name),
+                    _ => format!("Nach {} von…", a.name),
+                },
+                Some(|u| u.picking = None),
+                search(&stops, &ui.query, h, |u, s| match u.picking.take() {
+                    Some(Pick::To) => u.to = u.stop.replace(s),
+                    _ => u.to = Some(s),
                 }),
             ),
             (Some(a), None) => page(
@@ -255,15 +272,12 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                 &a.name,
                 Some(|u| u.stop = None),
                 [
-                    button(text("Fahrt von hier planen").color(Color::WHITE))
-                        .color(ACCENT)
-                        .on_click(move |cx| {
-                            cx.update(h, |u: &mut Ui| {
-                                u.picking = true;
-                                u.query.clear();
-                            })
-                        })
-                        .into(),
+                    row([
+                        plan(h, "Fahrt von hier", Pick::From),
+                        plan(h, "Fahrt hierher", Pick::To),
+                    ])
+                    .gap(8.0)
+                    .into(),
                     departures(a.uid.clone()),
                 ],
             ),
@@ -278,7 +292,10 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                         }),
                     };
                     let mut body = vec![line_filters(h, &ui.hidden), view.into()];
-                    body.extend(ui.center.and_then(|c| open_stop(h, &stops, c, "Abfahrten")));
+                    body.extend(
+                        ui.center
+                            .and_then(|c| open_stop(h, &stops, c, "Abfahrten", ACCENT)),
+                    );
                     page(h, "Liniennetz", Some(|u| u.screen = Screen::Stops), body)
                 }
                 (Screen::Lines, Some(l)) => page(
@@ -287,12 +304,8 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                     Some(|u| u.line = None),
                     lines::line(h, &stops, l, ui.dir),
                 ),
-                (Screen::Map, _) => page(
-                    h,
-                    "Karte",
-                    Some(|u| u.screen = Screen::Stops),
-                    [map::view(h, &stops, ui.tapped)],
-                ),
+                (Screen::Map, _) if ui.finding => map::find(h, &ui.address),
+                (Screen::Map, _) => map::page(h, &stops, ui),
                 (Screen::Lines, None) => page(
                     h,
                     "Linien",
@@ -323,35 +336,57 @@ fn page(
         .size(24.0)
         .color(INK)
         .shrink(1.0);
-    let mut items: Vec<Element> = match back {
-        Some(back) => vec![
-            on_back(move |cx| cx.update(h, back)).into(),
-            row([
-                button(text("‹").size(24.0).color(INK))
-                    .flat()
-                    .color(BG)
-                    .on_click(move |cx| cx.update(h, back))
-                    .into(),
-                title.into(),
-            ])
-            .align(AlignItems::CENTER)
-            .gap(8.0)
-            .into(),
-        ],
+    let Some(back) = back else {
         // The menu button, if any, leads `body` and joins the title's row.
-        None => {
-            let mut body = body.into_iter();
-            let lead = body.next().into_iter();
-            let head = row(lead.chain([title.size(26.0).into()]))
-                .align(AlignItems::CENTER)
-                .gap(8.0);
-            let mut items: Vec<Element> = vec![head.into()];
-            items.extend(body);
-            return column(items).gap(12.0).padding(16.0).fill().into();
-        }
+        let mut body = body.into_iter();
+        let lead = body.next().into_iter();
+        let head = row(lead.chain([title.size(26.0).into()]))
+            .align(AlignItems::CENTER)
+            .gap(8.0);
+        let mut items: Vec<Element> = vec![head.into()];
+        items.extend(body);
+        return column(items).gap(12.0).padding(16.0).fill().into();
     };
+    page_with(h, title.into(), back, body)
+}
+
+/// A page with a back button before `title`, which may hold more than text.
+fn page_with(
+    h: Handle<Ui>,
+    title: Element,
+    back: fn(&mut Ui),
+    body: impl IntoIterator<Item = Element>,
+) -> Element {
+    let mut items: Vec<Element> = vec![
+        on_back(move |cx| cx.update(h, back)).into(),
+        row([
+            button(text("‹").size(24.0).color(INK))
+                .flat()
+                .color(BG)
+                .on_click(move |cx| cx.update(h, back))
+                .into(),
+            title,
+        ])
+        .align(AlignItems::CENTER)
+        .gap(8.0)
+        .into(),
+    ];
     items.extend(body);
     column(items).gap(12.0).padding(16.0).fill().into()
+}
+
+/// A button that starts picking the other end of a trip with the open stop.
+fn plan(h: Handle<Ui>, label: &str, pick: Pick) -> Element {
+    button(text(label).color(Color::WHITE))
+        .color(ACCENT)
+        .grow(1.0)
+        .on_click(move |cx| {
+            cx.update(h, move |u: &mut Ui| {
+                u.picking = Some(pick);
+                u.query.clear();
+            })
+        })
+        .into()
 }
 
 fn search(stops: &[Stop], query: &str, h: Handle<Ui>, pick: fn(&mut Ui, Stop)) -> [Element; 2] {
@@ -394,11 +429,11 @@ fn search(stops: &[Stop], query: &str, h: Handle<Ui>, pick: fn(&mut Ui, Stop)) -
 }
 
 /// A button to the departures of snapshot stop `c`, if the stop list has it.
-fn open_stop(h: Handle<Ui>, stops: &[Stop], c: usize, note: &str) -> Option<Element> {
+fn open_stop(h: Handle<Ui>, stops: &[Stop], c: usize, note: &str, color: Color) -> Option<Element> {
     let name = &network::network().stops[c].0;
     let stop = stops.iter().find(|s| &s.name == name)?.clone();
     let label = text(format!("{name} – {note} ›")).color(Color::WHITE);
-    let open = button(label).color(ACCENT).on_click(move |cx| {
+    let open = button(label).color(color).on_click(move |cx| {
         let stop = stop.clone();
         cx.update(h, move |u: &mut Ui| u.stop = Some(stop))
     });
