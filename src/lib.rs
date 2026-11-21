@@ -184,6 +184,8 @@ struct Ui {
     dir: usize,
     /// Stop the network view is centred on, by snapshot index.
     center: Option<usize>,
+    /// Where the map was last tapped, in map metres.
+    tapped: Option<dfui::path::Point>,
 }
 
 /// Lines the network view shows until toggled.
@@ -209,6 +211,7 @@ impl Default for Ui {
             line: None,
             dir: 0,
             center: None,
+            tapped: None,
         }
     }
 }
@@ -275,7 +278,7 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                         }),
                     };
                     let mut body = vec![line_filters(h, &ui.hidden), view.into()];
-                    body.extend(ui.center.and_then(|c| open_stop(h, &stops, c)));
+                    body.extend(ui.center.and_then(|c| open_stop(h, &stops, c, "Abfahrten")));
                     page(h, "Liniennetz", Some(|u| u.screen = Screen::Stops), body)
                 }
                 (Screen::Lines, Some(l)) => page(
@@ -288,7 +291,7 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                     h,
                     "Karte",
                     Some(|u| u.screen = Screen::Stops),
-                    [map::view()],
+                    [map::view(h, &stops, ui.tapped)],
                 ),
                 (Screen::Lines, None) => page(
                     h,
@@ -391,10 +394,10 @@ fn search(stops: &[Stop], query: &str, h: Handle<Ui>, pick: fn(&mut Ui, Stop)) -
 }
 
 /// A button to the departures of snapshot stop `c`, if the stop list has it.
-fn open_stop(h: Handle<Ui>, stops: &[Stop], c: usize) -> Option<Element> {
+fn open_stop(h: Handle<Ui>, stops: &[Stop], c: usize, note: &str) -> Option<Element> {
     let name = &network::network().stops[c].0;
     let stop = stops.iter().find(|s| &s.name == name)?.clone();
-    let label = text(format!("{name} – Abfahrten ›")).color(Color::WHITE);
+    let label = text(format!("{name} – {note} ›")).color(Color::WHITE);
     let open = button(label).color(ACCENT).on_click(move |cx| {
         let stop = stop.clone();
         cx.update(h, move |u: &mut Ui| u.stop = Some(stop))

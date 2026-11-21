@@ -6,11 +6,11 @@ use std::rc::Rc;
 
 use dfui::path::Point;
 use dfui::widgets::{Styled, column, container, text};
-use dfui::{Color, Element, Font, Text};
+use dfui::{Color, Element, Font, Handle, Text};
 use dfui_map::{Layer, MapBuilder, MapData, map};
 use serde_json::Value;
 
-use crate::MUTED;
+use crate::{INK, MUTED, SHOWN_LINES, Stop, Ui, line_color, network, open_stop};
 
 /// Where `assets/innsbruck.json` is centred, degrees; it spans 4 km.
 const CENTER: (f64, f64) = (47.2655, 11.3980);
@@ -18,23 +18,69 @@ const CENTER: (f64, f64) = (47.2655, 11.3980);
 const START_SCALE: f32 = 0.3;
 const LAND: Color = Color::hex(0xf2efe9);
 
-/// The map, built on first use (a few hundred ms) and kept.
-fn data() -> Rc<MapData> {
+/// Stops listed after a tap on the map.
+const NEAREST: usize = 3;
+
+/// The map and where each snapshot stop lies on it (None without coordinates).
+struct City {
+    data: Rc<MapData>,
+    stops: Vec<Option<Point>>,
+}
+
+/// The city, built on first use (a few hundred ms) and kept.
+fn city() -> Rc<City> {
     thread_local! {
-        static MAP: OnceCell<Rc<MapData>> = const { OnceCell::new() };
+        static CITY: OnceCell<Rc<City>> = const { OnceCell::new() };
     }
-    MAP.with(|m| {
+    CITY.with(|m| {
         m.get_or_init(|| Rc::new(build(include_str!("../assets/innsbruck.json"))))
             .clone()
     })
 }
 
-/// The pannable, zoomable map with the credit OSM's licence (ODbL) asks for.
-pub fn view() -> Element {
-    let credit = text("© OpenStreetMap contributors").size(12.0).color(MUTED);
-    let m = map(&data()).start([0.0, 0.0], START_SCALE);
-    let m = container(m).bg(LAND).grow(1.0);
-    column([m.into(), credit.into()]).gap(4.0).grow(1.0).into()
+/// The pannable, zoomable map with the city lines and stops; a tap lists
+/// the stops closest to it. Ends with the credit OSM's licence (ODbL) asks for.
+pub fn view(h: Handle<Ui>, stops: &[Stop], tapped: Option<Point>) -> Element {
+    let city = city();
+    let m = map(&city.data)
+        .start([0.0, 0.0], START_SCALE)
+        .on_tap(move |cx, p| cx.update(h, move |u: &mut Ui| u.tapped = Some(p)));
+    let mut body = vec![container(m).bg(LAND).grow(1.0).into()];
+    if let Some(p) = tapped {
+        body.extend(nearest(&city.stops, p).into_iter().filter_map(|(c, d)| {
+            let walk = format!("{} m", (d / 10.0).round() * 10.0);
+            open_stop(h, stops, c, &walk)
+        }));
+    }
+    body.push(
+        text("© OpenStreetMap contributors")
+            .size(12.0)
+            .color(MUTED)
+            .into(),
+    );
+    column(body).gap(4.0).grow(1.0).into()
+}
+
+/// The `NEAREST` stops to `p` as (snapshot index, metres), closest first.
+fn nearest(stops: &[Option<Point>], p: Point) -> Vec<(usize, f32)> {
+    let mut by = (stops.iter().enumerate())
+        .filter_map(|(i, s)| s.map(|s| (i, (s[0] - p[0]).hypot(s[1] - p[1]))))
+        .collect::<Vec<_>>();
+    by.sort_by(|a, b| a.1.total_cmp(&b.1));
+    by.truncate(NEAREST);
+    by
+}
+
+/// A closed circle of `r` metres around `c`.
+fn circle(c: Point, r: f32) -> Vec<Point> {
+    let mut pts: Vec<Point> = (0..16)
+        .map(|i| {
+            let a = i as f32 * std::f32::consts::TAU / 16.0;
+            [c[0] + r * a.cos(), c[1] + r * a.sin()]
+        })
+        .collect();
+    pts.push(pts[0]);
+    pts
 }
 
 struct Style {
@@ -51,7 +97,7 @@ struct Style {
 /// A street name to place: its line, name and road width.
 type Name = (Vec<Point>, String, f32);
 
-fn build(json: &str) -> MapData {
+fn build(json: &str) -> City {
     let osm: Value = serde_json::from_str(json).expect("innsbruck.json");
     let mut b = MapBuilder::new(CENTER.0, CENTER.1);
     let style = Style {
@@ -65,6 +111,23 @@ fn build(json: &str) -> MapData {
         major: b.layer(Color::hex(0xf8d49c), 0.0),
         names: b.layer(Color::hex(0x5c5852), 0.0),
     };
+    let net = network::network();
+    let stops: Vec<Option<Point>> = (net.stops.iter())
+        .map(|&(_, lat, lon)| (lat != 0.0).then(|| b.point(lat.into(), lon.into())))
+        .collect();
+    // ponytail: straight from stop to stop, and shared stretches show only the last line drawn; route geometry from OSM if that misleads.
+    for &line in SHOWN_LINES.iter().rev() {
+        let layer = b.layer(line_color(line).0, 0.0);
+        for (_, _, run) in net.trips.iter().filter(|t| t.0 == line) {
+            let pts: Vec<Point> = run.iter().filter_map(|&i| stops[i]).collect();
+            b.line(layer, &pts, 8.0);
+        }
+    }
+    let (ring, dot) = (b.layer(INK, 0.0), b.layer(Color::WHITE, 0.0));
+    for &p in stops.iter().flatten() {
+        b.area(ring, &[circle(p, 11.0)], &[]);
+        b.area(dot, &[circle(p, 7.0)], &[]);
+    }
     let mut names = Vec::new();
     for e in osm["elements"].as_array().into_iter().flatten() {
         add(&mut b, &style, &mut names, e);
@@ -75,7 +138,10 @@ fn build(json: &str) -> MapData {
     for (pts, name, w) in &names {
         b.label(style.names, pts, &text, Font::DEFAULT, name, w * 0.75);
     }
-    b.build()
+    City {
+        data: Rc::new(b.build()),
+        stops,
+    }
 }
 
 fn ring(b: &MapBuilder, geometry: &Value) -> Vec<Point> {
@@ -144,8 +210,20 @@ mod tests {
 
     #[test]
     fn innsbruck_builds() {
-        let data = super::data();
-        assert!(data.tiles() > 1000, "{} shapes", data.tiles());
+        let city = super::city();
+        assert!(city.data.tiles() > 1000, "{} shapes", city.data.tiles());
+    }
+
+    #[test]
+    fn nearest_stops_come_closest_first() {
+        let stops = [
+            Some([0.0, 100.0]),
+            None,
+            Some([0.0, 10.0]),
+            Some([50.0, 0.0]),
+        ];
+        let n = super::nearest(&stops, [0.0, 0.0]);
+        assert_eq!(n, [(2, 10.0), (3, 50.0), (0, 100.0)]);
     }
 
     /// Downloads the area from Overpass and rewrites `assets/innsbruck.json`
