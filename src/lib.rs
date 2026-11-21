@@ -185,6 +185,8 @@ struct Ui {
     /// Stop the network view is centred on, by snapshot index.
     center: Option<usize>,
     pin: Option<map::Pin>,
+    /// Start of a trip to the pin.
+    from_stop: Option<Stop>,
     /// Where the map centres, set by an address search.
     focus: Option<dfui::path::Point>,
     /// The address search over the map is open.
@@ -197,6 +199,8 @@ struct Ui {
 enum Pick {
     From,
     To,
+    /// Picking where a trip to the map's pin starts.
+    ToPin,
 }
 
 /// Lines the network view shows until toggled.
@@ -223,6 +227,7 @@ impl Default for Ui {
             dir: 0,
             center: None,
             pin: None,
+            from_stop: None,
             focus: None,
             finding: false,
             address: String::new(),
@@ -253,7 +258,7 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                 h,
                 &format!("{} → {}", a.name, b.name),
                 Some(|u| u.to = None),
-                [connections(a, b)],
+                [connections(a, vec![(b, None)])],
             ),
             (Some(a), None) if ui.picking.is_some() => page(
                 h,
@@ -305,6 +310,24 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                     lines::line(h, &stops, l, ui.dir),
                 ),
                 (Screen::Map, _) if ui.finding => map::find(h, &ui.address),
+                (Screen::Map, _) if ui.picking == Some(Pick::ToPin) => page(
+                    h,
+                    &format!("Nach {} von…", map::pin_name(ui)),
+                    Some(|u| u.picking = None),
+                    search(&stops, &ui.query, h, |u, s| {
+                        u.picking = None;
+                        u.from_stop = Some(s);
+                    }),
+                ),
+                (Screen::Map, _) if ui.from_stop.is_some() => {
+                    let a = ui.from_stop.as_ref().unwrap();
+                    page(
+                        h,
+                        &format!("{} → {}", a.name, map::pin_name(ui)),
+                        Some(|u| u.from_stop = None),
+                        [map::trip_to_pin(&stops, ui, a)],
+                    )
+                }
                 (Screen::Map, _) => map::page(h, &stops, ui),
                 (Screen::Lines, None) => page(
                     h,
@@ -524,16 +547,20 @@ fn line_filters(h: Handle<Ui>, hidden: &HashSet<String>) -> Element {
 }
 
 /// Direct and one-change connections, refreshed like departures.
-fn connections(a: &Stop, b: &Stop) -> Element {
-    let ids = (a.uid.parse::<i64>(), b.uid.parse::<i64>());
-    let (Ok(a), Ok(b)) = ids else {
+/// Connections from `a` to any of `to`, each with the walk after it.
+fn connections(a: &Stop, to: Vec<(&Stop, Option<plan::Walk>)>) -> Element {
+    let to: Result<Vec<(i64, Option<plan::Walk>)>, _> = (to.into_iter())
+        .map(|(b, walk)| b.uid.parse::<i64>().map(|b| (b, walk)))
+        .collect();
+    let (Ok(a), Ok(to)) = (a.uid.parse::<i64>(), to) else {
         return message("Unbekannte Haltestelle.");
     };
+    let ids: Vec<i64> = to.iter().map(|t| t.0).collect();
     stream_builder(
-        (a, b),
+        (a, ids),
         move |_| {
             poll(
-                move || plan::fetch(a, b),
+                move || plan::fetch_to(a, &to),
                 |r| Some(if r.is_ok() { REFRESH } else { RETRY }),
             )
         },
@@ -571,7 +598,7 @@ fn connection(now: Option<f64>, c: &plan::Connection) -> Element {
             "{} → {}{}",
             plan::clock(now, c.dep()),
             if c.estimated() { "~" } else { "" },
-            plan::clock(now, c.arr())
+            plan::clock(now, c.at())
         ))
         .font(Font::BOLD)
         .size(16.0)
@@ -594,6 +621,14 @@ fn connection(now: Option<f64>, c: &plan::Connection) -> Element {
         .color(MUTED)
         .into(),
     ];
+    if let Some((stop, minutes)) = &c.walk {
+        rows.push(
+            text(format!("Ab {stop} {} min zu Fuß", minutes.round()))
+                .size(13.0)
+                .color(MUTED)
+                .into(),
+        );
+    }
     for w in c.legs.windows(2) {
         rows.push(
             text(format!(

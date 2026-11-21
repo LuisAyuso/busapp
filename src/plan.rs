@@ -68,8 +68,12 @@ pub struct Leg {
     pub estimated: bool,
 }
 
+/// The stop to get off at and the minutes to walk on from there.
+pub type Walk = (String, f64);
+
 pub struct Connection {
     pub legs: Vec<Leg>,
+    pub walk: Option<Walk>,
 }
 
 impl Connection {
@@ -78,6 +82,10 @@ impl Connection {
     }
     pub fn arr(&self) -> f64 {
         self.legs[self.legs.len() - 1].arr
+    }
+    /// Arrival at the destination, after any walk.
+    pub fn at(&self) -> f64 {
+        self.arr() + self.walk.as_ref().map_or(0.0, |w| w.1)
     }
     pub fn estimated(&self) -> bool {
         self.legs[self.legs.len() - 1].estimated
@@ -419,6 +427,7 @@ fn plan(
             if let Some(arr) = reaches_b(d) {
                 out.push(Connection {
                     legs: vec![leg(l, sa, d, arr)],
+                    walk: None,
                 });
             }
         }
@@ -442,6 +451,7 @@ fn plan(
             if let Some((d2, a2)) = catch(&st.departures, a1.minutes, reaches_b) {
                 out.push(Connection {
                     legs: vec![leg(l1, sa, d1, a1), leg(l2t, st, d2, a2)],
+                    walk: None,
                 });
             }
         }
@@ -472,17 +482,23 @@ fn plan(
             if let Some((d3, a3)) = catch(&s2.departures, a2.minutes, reaches_b) {
                 out.push(Connection {
                     legs: vec![leg(l1, sa, d1, a1), leg(m, s1, d2, a2), leg(n, s2, d3, a3)],
+                    walk: None,
                 });
             }
         }
     }
     out.retain(|c| c.dep() >= 0.0);
-    // Keeps only options no other one beats by leaving later and arriving no later.
-    out.sort_by(|x, y| {
-        x.arr()
-            .total_cmp(&y.arr())
-            .then(y.dep().total_cmp(&x.dep()))
-    });
+    best(&mut out);
+    Plan {
+        now: now(from),
+        connections: out,
+    }
+}
+
+/// Keeps only options no other one beats by leaving later and arriving no
+/// later, soonest arrival first.
+fn best(out: &mut Vec<Connection>) {
+    out.sort_by(|x, y| x.at().total_cmp(&y.at()).then(y.dep().total_cmp(&x.dep())));
     let mut latest = f64::NEG_INFINITY;
     out.retain(|c| {
         let keep = c.dep() > latest;
@@ -490,9 +506,38 @@ fn plan(
         keep
     });
     out.truncate(MAX_RESULTS);
-    Plan {
-        now: now(from),
-        connections: out,
+}
+
+/// Plans from `a` to each of `to` at once, each with the walk after it, and
+/// keeps the best by arrival after the walk. Fails only if every plan does.
+pub fn fetch_to(a: i64, to: &[(i64, Option<Walk>)]) -> Result<Plan, String> {
+    let plans: Vec<_> = std::thread::scope(|s| {
+        let runs: Vec<_> = (to.iter())
+            .map(|&(b, _)| s.spawn(move || fetch(a, b)))
+            .collect();
+        runs.into_iter()
+            .map(|r| r.join().unwrap_or(Err("panicked".into())))
+            .collect()
+    });
+    let (mut now, mut connections, mut error) = (None, Vec::new(), None);
+    for (p, (_, walk)) in plans.into_iter().zip(to) {
+        match p {
+            Ok(p) => {
+                now = now.or(p.now);
+                connections.extend(p.connections.into_iter().map(|c| Connection {
+                    walk: walk.clone(),
+                    ..c
+                }));
+            }
+            Err(e) => error = Some(e),
+        }
+    }
+    match error {
+        Some(e) if now.is_none() && connections.is_empty() => Err(e),
+        _ => {
+            best(&mut connections);
+            Ok(Plan { now, connections })
+        }
     }
 }
 
@@ -656,6 +701,32 @@ mod tests {
         let p = plan(&from, &to, &[], &[], &HashMap::new());
         let c = &p.connections[0];
         assert_eq!((c.dep(), c.arr(), c.estimated()), (6.0, 12.0, true));
+    }
+
+    #[test]
+    fn best_ranks_by_arrival_after_the_walk() {
+        let trip = |dep: f64, arr: f64, walk: f64| Connection {
+            legs: vec![Leg {
+                line: "1".into(),
+                direction: "x".into(),
+                from: "a".into(),
+                platform: "A".into(),
+                dep,
+                arr,
+                estimated: false,
+            }],
+            walk: Some(("b".into(), walk)),
+        };
+        // Arrives first by bus but walks longest; the one leaving earlier and
+        // arriving later after its walk is beaten and goes.
+        let mut out = vec![
+            trip(2.0, 10.0, 8.0),
+            trip(3.0, 12.0, 1.0),
+            trip(1.0, 9.0, 9.0),
+        ];
+        best(&mut out);
+        let at: Vec<f64> = out.iter().map(Connection::at).collect();
+        assert_eq!(at, [13.0]);
     }
 
     #[test]

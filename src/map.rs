@@ -15,16 +15,21 @@ use dfui_map::{Layer, MapBuilder, MapData, map};
 use serde_json::Value;
 
 use crate::{
-    ACCENT, INK, MAX_ROWS, MUTED, SHOWN_LINES, Stop, Ui, line_color, network, open_stop, page_with,
+    ACCENT, INK, MAX_ROWS, MUTED, Pick, SHOWN_LINES, Stop, Ui, connections, line_color, network,
+    open_stop, page_with,
 };
 
-/// Where `assets/innsbruck.json` is centred, degrees; it spans 4 km.
+/// Origin of the map's metres, degrees: the old town.
 const CENTER: (f64, f64) = (47.2655, 11.3980);
 /// Opening zoom, logical px per metre: the old town and the station.
 const START_SCALE: f32 = 0.3;
 /// Zoom a search result opens at, at least.
 const FOUND_SCALE: f32 = 1.0;
 const LAND: Color = Color::hex(0xf2efe9);
+/// Walking pace over the straight-line distance, metres a minute: 80 m/min
+/// on foot, less for streets that don't run straight to the stop.
+const WALK_PACE: f32 = 60.0;
+const CREDIT: &str = "© OpenStreetMap contributors";
 /// A tap names the closest address within this many metres.
 const ADDRESS_REACH: f32 = 60.0;
 /// The closest stops to the pin, one color each, on the map and their buttons.
@@ -89,6 +94,18 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui) -> Element {
             })
         })
         .overlay(move |cx, to_px| {
+            let r = cx.rect;
+            let w = cx.measure(CREDIT, Font::DEFAULT, 11.0, None).width;
+            let back = Rect::new(r.x, r.y + r.h - 18.0, w + 10.0, 18.0);
+            cx.fill(back, 0.0, Color::WHITE.alpha(0.7));
+            cx.text(
+                CREDIT,
+                Font::DEFAULT,
+                11.0,
+                INK,
+                None,
+                (r.x + 5.0, back.y + 2.0),
+            );
             for &(p, color) in &marks {
                 let [x, y] = to_px(p);
                 cx.fill(Rect::new(x - 10.0, y - 10.0, 20.0, 20.0), 10.0, color);
@@ -109,12 +126,17 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui) -> Element {
         let walk = format!("{} m", (d / 10.0).round() * 10.0);
         open_stop(h, stops, c, &walk, color)
     }));
-    body.push(
-        text("© OpenStreetMap contributors")
-            .size(12.0)
-            .color(MUTED)
-            .into(),
-    );
+    if pin.is_some() {
+        let go = button(text("Fahrt hierher").color(Color::WHITE))
+            .color(ACCENT)
+            .on_click(move |cx| {
+                cx.update(h, |u: &mut Ui| {
+                    u.picking = Some(Pick::ToPin);
+                    u.query.clear();
+                })
+            });
+        body.push(go.into());
+    }
     let mut head = vec![text("Karte").font(Font::BOLD).size(24.0).color(INK).into()];
     if let Some((_, Some(name))) = &pin {
         head.push(text(name).size(17.0).color(MUTED).shrink(1.0).into());
@@ -130,6 +152,30 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui) -> Element {
         |u| u.screen = Default::default(),
         [column(body).gap(4.0).grow(1.0).into()],
     )
+}
+
+/// What the pin is called in titles.
+pub fn pin_name(ui: &Ui) -> String {
+    let name = ui.pin.as_ref().and_then(|p| p.1.clone());
+    name.unwrap_or_else(|| "Markierung".into())
+}
+
+/// Connections from `a` to the stops closest to the pin, by arrival there
+/// after walking on from the stop.
+pub fn trip_to_pin(stops: &[Stop], ui: &Ui, a: &Stop) -> Element {
+    let city = city();
+    let Some((p, _)) = &ui.pin else {
+        return text("Keine Markierung.").into();
+    };
+    let near = nearest(&city.stops, *p);
+    let to = (near.iter())
+        .filter_map(|&(c, d)| {
+            let name = &network::network().stops[c].0;
+            let stop = stops.iter().find(|s| &s.name == name)?;
+            Some((stop, Some((name.clone(), f64::from(d / WALK_PACE)))))
+        })
+        .collect();
+    connections(a, to)
 }
 
 /// The address search: a street, or a street and house number.
@@ -434,17 +480,20 @@ mod tests {
         assert_eq!(n, [(2, 10.0), (3, 50.0), (0, 100.0)]);
     }
 
-    /// South, west, north, east of the 4 km square around `CENTER`.
+    /// South, west, north, east around the stops of the lines the map
+    /// draws, with ~500 m to spare.
     fn bbox() -> String {
-        let (lat, lon) = super::CENTER;
-        let (dlat, dlon) = (2.0 / 111.0, 2.0 / 111.0 / lat.to_radians().cos());
-        format!(
-            "{},{},{},{}",
-            lat - dlat,
-            lon - dlon,
-            lat + dlat,
-            lon + dlon
-        )
+        let net = crate::network::network();
+        let shown = (net.trips.iter()).filter(|t| crate::SHOWN_LINES.contains(&t.0.as_str()));
+        let (mut s, mut w, mut n, mut e) = (90.0_f32, 180.0_f32, -90.0_f32, -180.0_f32);
+        for &i in shown.flat_map(|t| &t.2) {
+            let (_, lat, lon) = net.stops[i];
+            if lat != 0.0 {
+                (s, w, n, e) = (s.min(lat), w.min(lon), n.max(lat), e.max(lon));
+            }
+        }
+        let m = 0.005;
+        format!("{},{},{},{}", s - m, w - m * 1.5, n + m, e + m * 1.5)
     }
 
     fn overpass(query: &str) -> Value {
@@ -459,11 +508,11 @@ mod tests {
             .find_map(|url| {
                 ureq::post(*url)
                     .config()
-                    .timeout_global(Some(std::time::Duration::from_secs(180)))
+                    .timeout_global(Some(std::time::Duration::from_secs(900)))
                     .build()
                     .header("User-Agent", "busapp-map-refresh")
                     .send_form([("data", query)])
-                    .and_then(|mut r| r.body_mut().with_config().limit(200 << 20).read_to_string())
+                    .and_then(|mut r| r.body_mut().with_config().limit(1 << 30).read_to_string())
                     .ok()
             })
             .expect("every Overpass instance is busy: retry in a minute");
@@ -508,7 +557,7 @@ mod tests {
     fn refresh_map() {
         let bbox = bbox();
         let query = format!(
-            "[out:json][timeout:120];(
+            "[out:json][timeout:600][maxsize:1073741824];(
               way[building]({bbox}); way[highway]({bbox}); way[railway=rail]({bbox});
               way[waterway]({bbox}); way[natural~\"^(water|wood)$\"]({bbox});
               way[leisure=park]({bbox}); way[landuse~\"^(grass|forest|meadow)$\"]({bbox});
