@@ -44,6 +44,13 @@ experimental `dfui-map`; refresh it with
 `assets/addresses.json` come from the same source:
 `cargo test --lib refresh_addresses -- --ignored`.
 
+The app doesn't bundle that JSON: it bundles the finished map tiles
+(`assets/innsbruck.map`, with `assets/streets.json` for the search), drawn
+from the JSON and the line network so Karte opens without building
+anything. After refreshing the map or the network, rewrite them with
+`cargo test --lib write_tiles -- --ignored`; `cargo test` fails while
+they're out of date.
+
 ## Releases
 
 Pushing a `v*` tag builds a signed APK and attaches it to a GitHub release:
