@@ -222,6 +222,7 @@ version = "0.1.0"
 dependencies = [
  "android_logger",
  "dfui",
+ "dfui-map",
  "futures-channel",
  "log",
  "serde",
@@ -413,9 +414,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "dfui"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21065c5d8b4f3ebaee254403bb591653018513e72ab1263b9b2bc77738534173"
+version = "0.1.2"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -432,6 +431,13 @@ dependencies = [
  "web-time",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "dfui-map"
+version = "0.1.0"
+dependencies = [
+ "dfui",
 ]
 
 [[package]]

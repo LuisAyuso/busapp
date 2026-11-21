@@ -7,7 +7,8 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-dfui = "0.1"
+dfui = { path = "../dfui" }
+dfui-map = { path = "../dfui/map" }
 futures-channel = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

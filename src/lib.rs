@@ -12,6 +12,7 @@ use dfui::widgets::{
 use dfui::{App, Color, Element, Font, Handle};
 
 mod lines;
+mod map;
 mod network;
 mod plan;
 use futures_channel::{mpsc, oneshot};
@@ -219,6 +220,7 @@ enum Screen {
     Stops,
     Network,
     Lines,
+    Map,
 }
 
 fn screen(stops: Rc<Vec<Stop>>) -> Element {
@@ -281,6 +283,12 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                     &format!("Linie {l}"),
                     Some(|u| u.line = None),
                     lines::line(h, &stops, l, ui.dir),
+                ),
+                (Screen::Map, _) => page(
+                    h,
+                    "Karte",
+                    Some(|u| u.screen = Screen::Stops),
+                    [map::view()],
                 ),
                 (Screen::Lines, None) => page(
                     h,
@@ -434,6 +442,7 @@ fn menu(h: Handle<Ui>, me: Shown) -> Element {
         item("Haltestellen", Screen::Stops),
         item("Liniennetz", Screen::Network),
         item("Linien", Screen::Lines),
+        item("Karte", Screen::Map),
     ])
     .gap(8.0)
     .into()
