@@ -8,11 +8,12 @@ use std::cell::OnceCell;
 use std::rc::Rc;
 
 use dfui::path::Point;
-use dfui::taffy::AlignItems;
+use dfui::taffy::{AlignItems, JustifyContent};
 use dfui::widgets::{
-    Styled, button, column, container, icon_button, row, scroll, spacer, text, text_input,
+    Styled, button, column, container, icon_button, on_back, overlay, row, scroll, spacer, text,
+    text_input,
 };
-use dfui::{Color, Element, Font, Handle, Path, Rect, Shape};
+use dfui::{Color, Element, Font, Handle, Path, Rect, Shadow, Shape};
 use dfui_map::{MapBuilder, MapData, map};
 
 use crate::{
@@ -30,6 +31,7 @@ const LAND: Color = Color::hex(0xf2efe9);
 /// on foot, less for streets that don't run straight to the stop.
 const WALK_PACE: f32 = 60.0;
 const CREDIT: &str = "© OpenStreetMap contributors";
+const CREDIT_HEIGHT: f32 = 18.0;
 /// A tap names the closest address within this many metres.
 const ADDRESS_REACH: f32 = 60.0;
 /// The closest stops to the pin, one color each, on the map and their buttons.
@@ -120,7 +122,7 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui) -> Element {
         .overlay(move |cx, to_px| {
             let r = cx.rect;
             let w = cx.measure(CREDIT, Font::DEFAULT, 11.0, None).width;
-            let back = Rect::new(r.x, r.y + r.h - 18.0, w + 10.0, 18.0);
+            let back = Rect::new(r.x, r.y + r.h - CREDIT_HEIGHT, w + 10.0, CREDIT_HEIGHT);
             cx.fill(back, 0.0, Color::WHITE.alpha(0.7));
             cx.text(
                 CREDIT,
@@ -145,11 +147,12 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui) -> Element {
                 cx.fill(Rect::new(x - 4.0, y - 27.0, 8.0, 8.0), 4.0, Color::WHITE);
             }
         });
-    let mut body = vec![container(m).bg(LAND).grow(1.0).into()];
-    body.extend(near.iter().zip(NEAR).filter_map(|(&(c, d), color)| {
-        let walk = format!("{} m", (d / 10.0).round() * 10.0);
-        open_stop(h, stops, c, &walk, color)
-    }));
+    let mut panel: Vec<Element> = (near.iter().zip(NEAR))
+        .filter_map(|(&(c, d), color)| {
+            let walk = format!("{} m", (d / 10.0).round() * 10.0);
+            open_stop(h, stops, c, &walk, color)
+        })
+        .collect();
     if pin.is_some() {
         let go = button(text("Fahrt hierher").color(Color::WHITE))
             .color(ACCENT)
@@ -159,23 +162,55 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui) -> Element {
                     u.query.clear();
                 })
             });
-        body.push(go.into());
+        panel.push(go.into());
     }
-    let mut head = vec![text("Karte").font(Font::BOLD).size(24.0).color(INK).into()];
+    let back = |u: &mut Ui| u.screen = Default::default();
+    let mut head: Vec<Element> = vec![
+        button(text("‹").size(24.0).color(INK))
+            .flat()
+            .color(Color::WHITE)
+            .on_click(move |cx| cx.update(h, back))
+            .into(),
+        text("Karte").font(Font::BOLD).size(22.0).color(INK).into(),
+    ];
     if let Some((_, Some(name))) = &pin {
-        head.push(text(name).size(17.0).color(MUTED).shrink(1.0).into());
+        head.push(text(name).size(16.0).color(MUTED).shrink(1.0).into());
     }
     let find = icon_button(&magnifier())
         .color(INK)
         .on_click(move |cx| cx.update(h, |u: &mut Ui| u.finding = true));
     head.extend([spacer().grow(1.0).into(), find.into()]);
-    let head = row(head).align(AlignItems::CENTER).gap(10.0).grow(1.0);
-    page_with(
-        h,
-        head.into(),
-        |u| u.screen = Default::default(),
-        [column(body).gap(4.0).grow(1.0).into()],
-    )
+    let head = row(head)
+        .align(AlignItems::CENTER)
+        .gap(6.0)
+        .padding_xy(4.0, 2.0);
+    // Overlays take taps on their content, so those don't drop a pin.
+    let mut layers = vec![
+        on_back(move |cx| cx.update(h, back)).into(),
+        container(m).bg(LAND).grow(1.0).into(),
+        overlay(card(head.into())).padding(12.0).into(),
+    ];
+    if !panel.is_empty() {
+        let panel = overlay(column(panel).gap(6.0))
+            .justify(JustifyContent::END)
+            .padding_xy(12.0, CREDIT_HEIGHT + 8.0);
+        layers.push(panel.into());
+    }
+    column(layers).fill().into()
+}
+
+/// A white rounded card with a soft shadow, to read over the map.
+fn card(e: Element) -> Element {
+    let shadow = Shadow {
+        color: Color::BLACK.alpha(0.18),
+        offset: (0.0, 2.0),
+        blur: 8.0,
+    };
+    container(e)
+        .bg(Color::WHITE)
+        .radius(14.0)
+        .shadow(shadow)
+        .into()
 }
 
 /// What the pin is called in titles.
