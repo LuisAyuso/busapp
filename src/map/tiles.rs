@@ -175,55 +175,94 @@ fn write_tiles() {
     std::fs::write(STREETS, serde_json::to_string(&streets).unwrap()).unwrap();
 }
 
-/// South, west, north, east around the stops of the lines the map
-/// draws, with ~500 m to spare.
-fn bbox() -> String {
+/// South, west, north, east around the stops of the lines the map draws,
+/// with ~500 m to spare, cut into `n` × `n` boxes: public Overpass
+/// instances time out on the whole area at once.
+fn bboxes(n: usize) -> Vec<String> {
     let net = crate::network::network();
     let shown = (net.trips.iter()).filter(|t| crate::SHOWN_LINES.contains(&t.0.as_str()));
-    let (mut s, mut w, mut n, mut e) = (90.0_f32, 180.0_f32, -90.0_f32, -180.0_f32);
+    let (mut s, mut w, mut no, mut e) = (90.0_f64, 180.0_f64, -90.0_f64, -180.0_f64);
     for &i in shown.flat_map(|t| &t.2) {
         let (_, lat, lon) = net.stops[i];
+        let (lat, lon) = (f64::from(lat), f64::from(lon));
         if lat != 0.0 {
-            (s, w, n, e) = (s.min(lat), w.min(lon), n.max(lat), e.max(lon));
+            (s, w, no, e) = (s.min(lat), w.min(lon), no.max(lat), e.max(lon));
         }
     }
     let m = 0.005;
-    format!("{},{},{},{}", s - m, w - m * 1.5, n + m, e + m * 1.5)
+    let (s, w, no, e) = (s - m, w - m * 1.5, no + m, e + m * 1.5);
+    let (dlat, dlon) = ((no - s) / n as f64, (e - w) / n as f64);
+    let corner = |i: usize, j: usize| (s + dlat * i as f64, w + dlon * j as f64);
+    (0..n * n)
+        .map(|k| {
+            let ((s, w), (no, e)) = (corner(k / n, k % n), corner(k / n + 1, k % n + 1));
+            format!("{s:.6},{w:.6},{no:.6},{e:.6}")
+        })
+        .collect()
+}
+
+/// The elements `query` finds in each of `n` × `n` boxes, each once.
+fn overpass_tiled(query: impl Fn(&str) -> String, n: usize) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (i, b) in bboxes(n).iter().enumerate() {
+        let osm = overpass(&query(b));
+        let elements = osm["elements"].as_array().cloned().unwrap_or_default();
+        eprintln!("box {}/{}: {} elements", i + 1, n * n, elements.len());
+        for e in elements {
+            if seen.insert((e["type"].to_string(), e["id"].to_string())) {
+                out.push(e);
+            }
+        }
+    }
+    out
 }
 
 fn overpass(query: &str) -> Value {
-    // Public instances turn queries away when busy; try each.
+    // Public instances turn queries away when busy; try each, then wait.
     let servers = [
+        "https://z.overpass-api.de/api/interpreter",
         "https://overpass-api.de/api/interpreter",
         "https://overpass.private.coffee/api/interpreter",
         "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     ];
-    let body = servers
-        .iter()
-        .find_map(|url| {
-            ureq::post(*url)
+    for round in 0..5 {
+        if round > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+        let body = servers.iter().find_map(|url| {
+            let r = ureq::post(*url)
                 .config()
-                .timeout_global(Some(std::time::Duration::from_secs(900)))
+                .timeout_global(Some(std::time::Duration::from_secs(300)))
                 .build()
                 .header("User-Agent", "busapp-map-refresh")
                 .send_form([("data", query)])
-                .and_then(|mut r| r.body_mut().with_config().limit(1 << 30).read_to_string())
-                .ok()
-        })
-        .expect("every Overpass instance is busy: retry in a minute");
-    serde_json::from_str(&body).unwrap()
+                .and_then(|mut r| r.body_mut().with_config().limit(1 << 30).read_to_string());
+            if let Err(e) = &r {
+                eprintln!("{url}: {e}");
+            }
+            r.ok()
+        });
+        if let Some(osm) = body.and_then(|b| serde_json::from_str(&b).ok()) {
+            return osm;
+        }
+    }
+    panic!("every Overpass instance stayed busy");
 }
 
 /// Rewrites `assets/addresses.json` as `[street, number, lat, lon]` rows.
 #[test]
 #[ignore = "downloads a few MB from a public Overpass instance"]
 fn refresh_addresses() {
-    let bbox = bbox();
-    let osm = overpass(&format!(
-        "[out:json][timeout:120];nwr[\"addr:street\"][\"addr:housenumber\"]({bbox});out center;"
-    ));
-    let mut rows: Vec<(String, String, f64, f64)> = (osm["elements"].as_array().into_iter())
-        .flatten()
+    let elements = overpass_tiled(
+        |bbox| {
+            format!(
+                "[out:json][timeout:180];nwr[\"addr:street\"][\"addr:housenumber\"]({bbox});out center;"
+            )
+        },
+        2,
+    );
+    let mut rows: Vec<(String, String, f64, f64)> = (elements.iter())
         .filter_map(|e| {
             let at = if e["center"].is_object() {
                 &e["center"]
@@ -250,16 +289,19 @@ fn refresh_addresses() {
 #[test]
 #[ignore = "downloads ~20 MB from a public Overpass instance"]
 fn refresh_map() {
-    let bbox = bbox();
-    let query = format!(
-        "[out:json][timeout:600][maxsize:1073741824];(
-          way[building]({bbox}); way[highway]({bbox}); way[railway=rail]({bbox});
-          way[waterway]({bbox}); way[natural~\"^(water|wood)$\"]({bbox});
-          way[leisure=park]({bbox}); way[landuse~\"^(grass|forest|meadow)$\"]({bbox});
-          relation[natural=water]({bbox}); relation[building]({bbox});
-        );out geom;"
+    let raw = overpass_tiled(
+        |bbox| {
+            format!(
+                "[out:json][timeout:300];(
+                  way[building]({bbox}); way[highway]({bbox}); way[railway=rail]({bbox});
+                  way[waterway]({bbox}); way[natural~\"^(water|wood)$\"]({bbox});
+                  way[leisure=park]({bbox}); way[landuse~\"^(grass|forest|meadow)$\"]({bbox});
+                  relation[natural=water]({bbox}); relation[building]({bbox});
+                );out geom;"
+            )
+        },
+        3,
     );
-    let osm = overpass(&query);
     const KEEP: [&str; 8] = [
         "name", "building", "highway", "railway", "waterway", "natural", "leisure", "landuse",
     ];
@@ -269,7 +311,7 @@ fn refresh_map() {
         pts.map(|p| json!({"lat": round(&p["lat"]), "lon": round(&p["lon"])}))
             .collect()
     };
-    let elements: Vec<Value> = (osm["elements"].as_array().into_iter().flatten())
+    let elements: Vec<Value> = (raw.iter())
         .map(|e| {
             let tags: Map<String, Value> = (e["tags"].as_object().into_iter().flatten())
                 .filter(|(k, _)| KEEP.contains(&k.as_str()))

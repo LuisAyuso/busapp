@@ -38,7 +38,7 @@ API; refresh it with `cargo test --lib refresh_network -- --ignored`
 (about a minute).
 
 The map in `assets/innsbruck.json` is OpenStreetMap data (© OpenStreetMap
-contributors, ODbL) for 4×4 km around the centre, drawn with dfui's
+contributors, ODbL) around every stop of the city lines, drawn with dfui's
 experimental `dfui-map`; refresh it with
 `cargo test --lib refresh_map -- --ignored`. The addresses in
 `assets/addresses.json` come from the same source:
