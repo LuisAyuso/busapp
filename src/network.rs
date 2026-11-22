@@ -5,8 +5,9 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::OnceLock;
 
+use dfui::path::Stroke;
 use dfui::taffy::{Dimension, Size, Style};
-use dfui::{Color, Element, Event, EventCx, Font, Instant, PaintCx, Path, Rect, Widget};
+use dfui::{Color, Element, Event, EventCx, Font, Instant, OnChange, PaintCx, Path, Rect, Widget};
 use serde::{Deserialize, Serialize};
 
 use crate::{ACCENT, INK, MUTED, line_color};
@@ -270,8 +271,6 @@ impl Sim {
     }
 }
 
-pub type OnSelect = Box<dyn Fn(&mut EventCx, Option<usize>)>;
-
 /// The network, laid out around `center`; drag to pan, wheel to zoom, tap a
 /// stop to pick it (again to let go).
 pub struct NetworkView {
@@ -280,7 +279,7 @@ pub struct NetworkView {
     pub zoom: i32,
     /// Stop index the layout radiates from.
     pub center: Option<usize>,
-    pub on_select: OnSelect,
+    pub on_select: OnChange<Option<usize>>,
 }
 
 impl From<NetworkView> for Element {
@@ -376,13 +375,9 @@ impl Widget for NetworkView {
             let lanes = p.lines.len() as f32;
             for (i, &line) in p.lines.iter().enumerate() {
                 let o = (i as f32 - (lanes - 1.0) / 2.0) * LANE;
-                let (lo, hi) = (
-                    mul(nrm, o - LINE_WIDTH / 2.0),
-                    mul(nrm, o + LINE_WIDTH / 2.0),
-                );
-                // Same winding for every segment, so overlaps don't cancel.
-                let quad = Path::polygon(&[add(a, lo), add(b, lo), add(b, hi), add(a, hi)]);
-                shapes[line].contours.extend(quad.contours);
+                let off = mul(nrm, o);
+                let lane = Path::stroke(&[add(a, off), add(b, off)], Stroke::new(LINE_WIDTH));
+                shapes[line].contours.extend(lane.contours);
             }
         }
         let mut served = vec![0usize; n];
@@ -476,52 +471,42 @@ impl Widget for NetworkView {
     }
 
     fn event(&self, ev: &Event, cx: &mut EventCx) {
-        let r = cx.rect;
-        let sim: &mut Sim = cx.state.get();
-        if sim.zoom == 0.0 {
-            return;
-        }
-        let (capture, redraw, picked) = self.pointer(ev, r, sim);
-        if capture {
-            cx.capture();
-        }
-        if redraw {
-            cx.request_redraw();
-        }
-        if let Some(c) = picked {
-            (self.on_select)(cx, c);
-        }
+        cx.with_state(|sim: &mut Sim, cx| {
+            if sim.zoom != 0.0 {
+                self.pointer(ev, sim, cx);
+            }
+        });
     }
 }
 
 impl NetworkView {
-    /// Whether to capture the pointer and to redraw, and a newly picked centre.
-    fn pointer(&self, ev: &Event, r: Rect, sim: &mut Sim) -> (bool, bool, Option<Option<usize>>) {
+    /// Pans on a drag, zooms on the wheel and picks a centre on a tap.
+    fn pointer(&self, ev: &Event, sim: &mut Sim, cx: &mut EventCx) {
+        let r = cx.rect;
         match *ev {
             Event::PointerDown { x, y } => {
                 sim.press = Some(([x, y], [x, y], false));
-                (true, false, None)
+                cx.capture();
             }
             Event::PointerMove { x, y } => {
                 let Some((start, last, dragging)) = sim.press else {
-                    return (false, false, None);
+                    return;
                 };
                 let dragging = dragging || len(sub([x, y], start)) > SLOP;
                 if dragging {
                     sim.pan = add(sim.pan, mul(sub([x, y], last), 1.0 / sim.scale(self)));
                     sim.recenter = false;
+                    cx.request_redraw();
                 }
                 sim.press = Some((start, [x, y], dragging));
-                (false, dragging, None)
             }
             Event::PointerUp { x, y } => {
                 let Some((_, _, false)) = sim.press.take() else {
-                    return (false, false, None);
+                    return;
                 };
-                let hidden = &self.hidden;
                 let net = network();
                 let lines = net.lines();
-                let pairs = pairs(net, &lines, hidden);
+                let pairs = pairs(net, &lines, &self.hidden);
                 let tapped = pairs
                     .iter()
                     .flat_map(|p| [p.a, p.b])
@@ -529,20 +514,12 @@ impl NetworkView {
                     .filter(|&(_, d)| d < TAP)
                     .min_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(i, _)| i);
-                let Some(i) = tapped else {
-                    return (false, false, None);
-                };
-                let picked = if self.center == Some(i) {
-                    None
-                } else {
-                    Some(i)
-                };
-                (false, false, Some(picked))
+                if let Some(i) = tapped {
+                    let picked = (self.center != Some(i)).then_some(i);
+                    (self.on_select)(cx, picked);
+                }
             }
-            Event::Cancel | Event::Leave => {
-                sim.press = None;
-                (false, false, None)
-            }
+            Event::Cancel | Event::Leave => sim.press = None,
             Event::Wheel { x, y, dy } => {
                 let c = [r.x + r.w / 2.0, r.y + r.h / 2.0];
                 let k = sim.scale(self);
@@ -551,9 +528,9 @@ impl NetworkView {
                 sim.zoomed = true;
                 sim.pan = sub(mul(sub([x, y], c), 1.0 / sim.scale(self)), world);
                 sim.recenter = false;
-                (false, true, None)
+                cx.request_redraw();
             }
-            _ => (false, false, None),
+            _ => {}
         }
     }
 }

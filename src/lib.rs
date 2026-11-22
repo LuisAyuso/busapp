@@ -1,22 +1,21 @@
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
+use dfui::source::Polled;
 use dfui::taffy::{AlignItems, JustifyContent};
 use dfui::widgets::{
-    Container, Overlays, Shown, Snapshot, Styled, button, column, container, drawer,
-    future_builder, on_back, overlays, row, scroll, spacer, stateful, stream_builder, text,
-    text_input, watch,
+    self, Container, Overlays, Shown, Snapshot, Styled, button, column, container, drawer, heading,
+    icon_button, overlays, row, scroll, spacer, stateful, stream_builder, text, text_input, watch,
 };
-use dfui::{App, Color, Element, Font, Handle};
+use dfui::{App, Cache, Color, Element, Font, Handle, Latest, Scope, blocking, cached, polled};
 
 mod gps;
 mod lines;
 mod map;
 mod network;
 mod plan;
-use futures_channel::{mpsc, oneshot};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
@@ -117,46 +116,21 @@ pub fn parse_passages(json: &str) -> Result<Vec<Passage>, String> {
         .collect())
 }
 
-/// Calls `fetch` on a thread and streams each result; `again` picks the delay
-/// before the next call, or stops. Dropping the receiver ends the thread;
-/// `fetch` gets a check of whether the result is still wanted, so a long one
-/// can stop early.
+/// Calls `fetch` on a thread, then again after the delay `again` picks for
+/// its result, or stops; `fetch` gets whether its result is still wanted,
+/// so a long one can stop early once its screen is gone.
 fn poll<T: Send + 'static>(
-    fetch: impl Fn(plan::Wanted) -> Result<T, String> + Send + 'static,
-    again: impl Fn(&Result<T, String>) -> Option<Duration> + Send + 'static,
-) -> mpsc::UnboundedReceiver<Result<T, String>> {
-    let (tx, rx) = mpsc::unbounded();
-    std::thread::spawn(move || {
-        loop {
-            let r = fetch(&|| !tx.is_closed());
-            let wait = again(&r);
-            if tx.unbounded_send(r).is_err() {
-                return;
-            }
-            match wait {
-                Some(d) => std::thread::sleep(d),
-                None => return,
-            }
-        }
-    });
-    rx
-}
-
-/// Stream collector that keeps only the newest item.
-pub struct Latest<T>(Option<T>);
-
-impl<T> Default for Latest<T> {
-    fn default() -> Self {
-        Latest(None)
-    }
-}
-
-impl<T> Extend<T> for Latest<T> {
-    fn extend<I: IntoIterator<Item = T>>(&mut self, it: I) {
-        if let Some(v) = it.into_iter().last() {
-            self.0 = Some(v);
-        }
-    }
+    fetch: impl Fn(plan::Wanted) -> Result<T, String> + Send + Sync + 'static,
+    again: impl Fn(&Result<T, String>) -> Option<Duration> + 'static,
+) -> Polled<Result<T, String>> {
+    let fetch = Arc::new(fetch);
+    polled(
+        move || {
+            let fetch = fetch.clone();
+            blocking(move |w| fetch(&|| w.get()))
+        },
+        again,
+    )
 }
 
 pub struct Bus;
@@ -179,7 +153,7 @@ impl App for Bus {
                 )
             },
             |snap: &Snapshot<Latest<Result<Vec<Stop>, String>>>| -> Element {
-                match &snap.data.0 {
+                match &snap.data.get() {
                     Some(Ok(stops)) => screen(Rc::new(stops.clone())),
                     Some(Err(e)) => message(&format!(
                         "Haltestellen konnten nicht geladen werden, neuer Versuch…\n{e}"
@@ -291,7 +265,7 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
             (Some(a), Some(b)) => page(
                 h,
                 &format!("{} → {}", a.name, b.name),
-                Some(|u| u.to = None),
+                |u| u.to = None,
                 [connections(vec![(a, b, None, None)])],
             ),
             (Some(a), None) if ui.picking.is_some() => page(
@@ -300,7 +274,7 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                     Some(Pick::From) => format!("Von {} nach…", a.name),
                     _ => format!("Nach {} von…", a.name),
                 },
-                Some(|u| u.picking = None),
+                |u| u.picking = None,
                 search(&stops, &ui.query, h, |u, s| match u.picking.take() {
                     Some(Pick::To) => u.to = u.stop.replace(s),
                     _ => u.to = Some(s),
@@ -309,7 +283,7 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
             (Some(a), None) => page(
                 h,
                 &a.name,
-                Some(|u| u.stop = None),
+                |u| u.stop = None,
                 [
                     row([
                         plan(h, "Fahrt von hier", Pick::From),
@@ -335,19 +309,19 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                         ui.center
                             .and_then(|c| open_stop(h, &stops, c, "Abfahrten", ACCENT)),
                     );
-                    page(h, "Liniennetz", Some(|u| u.screen = Screen::Map), body)
+                    page(h, "Liniennetz", |u| u.screen = Screen::Map, body)
                 }
                 (Screen::Lines, Some(l)) => page(
                     h,
                     &format!("Linie {l}"),
-                    Some(|u| u.line = None),
+                    |u| u.line = None,
                     lines::line(h, &stops, l, ui.dir),
                 ),
                 (Screen::Map, _) if ui.finding => map::find(h, &ui.address),
                 (Screen::Map, _) if ui.picking == Some(Pick::ToPin) => page(
                     h,
                     &format!("Nach {} von…", map::pin_name(ui)),
-                    Some(|u| u.picking = None),
+                    |u| u.picking = None,
                     search(&stops, &ui.query, h, |u, s| {
                         u.picking = None;
                         u.from_stop = Some(s);
@@ -356,7 +330,7 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                 (Screen::Map, _) if ui.picking == Some(Pick::FromPin) => page(
                     h,
                     &format!("Von {} nach…", map::pin_name(ui)),
-                    Some(|u| u.picking = None),
+                    |u| u.picking = None,
                     search(&stops, &ui.query, h, |u, s| {
                         u.picking = None;
                         u.to_stop = Some(s);
@@ -367,7 +341,7 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                     page(
                         h,
                         &format!("{} → {}", a.name, map::pin_name(ui)),
-                        Some(|u| u.from_stop = None),
+                        |u| u.from_stop = None,
                         [map::trip_to_pin(&stops, ui, a)],
                     )
                 }
@@ -376,21 +350,18 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                     page(
                         h,
                         &format!("{} → {}", map::pin_name(ui), b.name),
-                        Some(|u| u.to_stop = None),
+                        |u| u.to_stop = None,
                         [map::trip_from_pin(&stops, ui, b)],
                     )
                 }
                 (Screen::Map, _) => map::page(h, &stops, ui, ov),
-                (Screen::Lines, None) => page(
-                    h,
-                    "Linien",
-                    Some(|u| u.screen = Screen::Map),
-                    [lines::all(h)],
-                ),
+                (Screen::Lines, None) => {
+                    page(h, "Linien", |u| u.screen = Screen::Map, [lines::all(h)])
+                }
                 (Screen::Stops, _) => page(
                     h,
                     "Haltestellen",
-                    Some(|u| u.screen = Screen::Map),
+                    |u| u.screen = Screen::Map,
                     search(&stops, &ui.query, h, |u, s| u.stop = Some(s)),
                 ),
             },
@@ -400,55 +371,28 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
     .into()
 }
 
-/// A screen: title, a back button and the system back gesture when `back` is set, then `body`.
+/// A screen titled `title` whose back arrow, like the system back, runs `back`.
 fn page(
     h: Handle<Ui>,
     title: &str,
-    back: Option<fn(&mut Ui)>,
+    back: fn(&mut Ui),
     body: impl IntoIterator<Item = Element>,
 ) -> Element {
-    let title = text(title)
-        .font(Font::BOLD)
-        .size(24.0)
-        .color(INK)
-        .shrink(1.0);
-    let Some(back) = back else {
-        // The menu button, if any, leads `body` and joins the title's row.
-        let mut body = body.into_iter();
-        let lead = body.next().into_iter();
-        let head = row(lead.chain([title.size(26.0).into()]))
-            .align(AlignItems::CENTER)
-            .gap(8.0);
-        let mut items: Vec<Element> = vec![head.into()];
-        items.extend(body);
-        return column(items).gap(12.0).padding(16.0).fill().into();
-    };
+    let title = heading(title).size(24.0).color(INK).shrink(1.0);
     page_with(h, title.into(), back, body)
 }
 
-/// A page with a back button before `title`, which may hold more than text.
+/// A [`page`] whose title may hold more than text.
 fn page_with(
     h: Handle<Ui>,
     title: Element,
     back: fn(&mut Ui),
     body: impl IntoIterator<Item = Element>,
 ) -> Element {
-    let mut items: Vec<Element> = vec![
-        on_back(move |cx| cx.update(h, back)).into(),
-        row([
-            button(text("‹").size(24.0).color(INK))
-                .flat()
-                .color(BG)
-                .on_click(move |cx| cx.update(h, back))
-                .into(),
-            title,
-        ])
-        .align(AlignItems::CENTER)
-        .gap(8.0)
-        .into(),
-    ];
-    items.extend(body);
-    column(items).gap(12.0).padding(16.0).fill().into()
+    widgets::page(title)
+        .back(move |cx| cx.update(h, back))
+        .children(body)
+        .into()
 }
 
 /// A button that starts picking the other end of a trip with the open stop.
@@ -516,18 +460,9 @@ fn open_stop(h: Handle<Ui>, stops: &[Stop], c: usize, note: &str, color: Color) 
     Some(open.into())
 }
 
-fn menu_button(h: Handle<Ui>, ov: Handle<Overlays>, bg: Color) -> Element {
-    let bar = || -> Element {
-        container(spacer())
-            .width(20.0)
-            .height(2.5)
-            .radius(1.0)
-            .bg(INK)
-            .into()
-    };
-    button(column([bar(), bar(), bar()]).gap(4.0))
-        .flat()
-        .color(bg)
+fn menu_button(h: Handle<Ui>, ov: Handle<Overlays>) -> Element {
+    icon_button(&dfui::icons::menu())
+        .color(INK)
         .on_click(move |cx| ov.show(cx, move |me| drawer(menu(h, me))))
         .into()
 }
@@ -620,7 +555,7 @@ fn connections(trips: Vec<(&Stop, &Stop, Option<plan::Walk>, Option<plan::Walk>)
             )
         },
         |snap: &Snapshot<Latest<Result<plan::Plan, String>>>| -> Element {
-            match &snap.data.0 {
+            match &snap.data.get() {
                 None => message("Verbindungen werden gesucht…"),
                 Some(Err(e)) => message(&format!("Verbindungen konnten nicht geladen werden, neuer Versuch…\n{e}")),
                 Some(Ok(p)) if p.connections.is_empty() => {
@@ -714,41 +649,22 @@ fn connection(now: Option<f64>, c: &plan::Connection) -> Element {
 
 thread_local! {
     /// Lines per stop uid; they don't change while the app runs.
-    static LINES: RefCell<HashMap<String, Rc<Vec<String>>>> = RefCell::default();
+    static LINES: Cache<String, Rc<Vec<String>>> = Cache::new();
 }
 
 /// Badges of the lines serving a stop, fetched once per stop on first show.
-// ponytail: a thread per visible row (≤ MAX_ROWS); a pool if that ever hurts.
 fn stop_lines(uid: &str) -> Element {
-    if let Some(lines) = LINES.with_borrow(|m| m.get(uid).cloned()) {
-        return badges(&lines);
-    }
-    let id = uid.to_string();
-    future_builder(
-        uid,
-        move |_| {
-            let (tx, rx) = oneshot::channel();
-            let url = format!("{API}/ROUTES?stopID={id}");
-            std::thread::spawn(move || {
-                let _ = tx.send(get::<Vec<RouteEntry>>(&url));
-            });
-            async move {
-                let routes = rx.await.ok()?.ok()?;
-                let lines = Rc::new(sort_lines(
-                    routes.into_iter().map(|r| r.route.name).collect(),
-                ));
-                LINES.with_borrow_mut(|m| m.insert(id, lines.clone()));
-                Some(lines)
-            }
-        },
-        |snap: &Snapshot<Option<Option<Rc<Vec<String>>>>>| -> Element {
-            match &snap.data {
-                Some(Some(lines)) => badges(lines),
-                _ => spacer().into(),
-            }
-        },
-    )
-    .into()
+    let url = format!("{API}/ROUTES?stopID={uid}");
+    let fetch = move |_: Scope| async move {
+        let routes = blocking(move |_| get::<Vec<RouteEntry>>(&url)).await.ok()?;
+        let lines = routes.into_iter().map(|r| r.route.name).collect();
+        Some(Rc::new(sort_lines(lines)))
+    };
+    let show = |lines: Option<&Rc<Vec<String>>>| match lines {
+        Some(lines) => badges(lines),
+        None => spacer().into(),
+    };
+    cached(&LINES.with(Cache::clone), uid.to_string(), fetch, show)
 }
 
 fn badges(lines: &[String]) -> Element {
@@ -785,7 +701,7 @@ fn departures(uid: String) -> Element {
             )
         },
         |snap: &Snapshot<Latest<Result<Vec<Passage>, String>>>| -> Element {
-            match &snap.data.0 {
+            match &snap.data.get() {
                 None => message("Abfahrten werden geladen…"),
                 Some(Err(e)) => message(&format!(
                     "Abfahrten konnten nicht geladen werden, neuer Versuch…\n{e}"
@@ -932,13 +848,5 @@ mod tests {
             sort_lines(l(&["504", "R", "2", "STB", "420", "2"])),
             l(&["2", "STB", "R", "504", "420"])
         );
-    }
-
-    #[test]
-    fn latest_keeps_newest() {
-        let mut l = Latest::default();
-        l.extend([1, 2]);
-        l.extend([3]);
-        assert_eq!(l.0, Some(3));
     }
 }

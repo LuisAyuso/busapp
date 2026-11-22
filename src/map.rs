@@ -230,7 +230,7 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui, ov: Handle<Overlays>) -> Ele
         ]);
         panel.push(trips.gap(6.0).into());
     }
-    let mut head: Vec<Element> = vec![menu_button(h, ov, Color::WHITE)];
+    let mut head: Vec<Element> = vec![menu_button(h, ov)];
     match &pin {
         Some((_, Some(name))) => head.push(text(name).size(17.0).color(INK).shrink(1.0).into()),
         None if ui.locating => {

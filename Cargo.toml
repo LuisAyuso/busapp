@@ -9,7 +9,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 dfui = { path = "../dfui" }
 dfui-map = { path = "../dfui/map" }
-futures-channel = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = "3.5"
