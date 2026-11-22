@@ -338,3 +338,64 @@ fn refresh_map() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/innsbruck.json");
     std::fs::write(path, json!({"elements": elements}).to_string()).unwrap();
 }
+
+/// Grid steps of the elevation grid, degrees: about 165 m each way, finer
+/// than the walks it judges and within the API's hourly allowance.
+const ELEVATION_STEP: (f64, f64) = (0.0015, 0.00225);
+
+/// Rewrites `assets/elevation.json` as `[south, west, dlat, dlon, columns,
+/// [metres, row by row from the south-west]]` over the map's area, from
+/// Open-Meteo's elevation API (Copernicus 90 m DEM).
+#[test]
+#[ignore = "downloads ~100 batches from api.open-meteo.com"]
+fn refresh_elevation() {
+    let b = bboxes(1);
+    let v: Vec<f64> = b[0].split(',').map(|x| x.parse().unwrap()).collect();
+    let (s, w, no, e) = (v[0], v[1], v[2], v[3]);
+    let (dlat, dlon) = ELEVATION_STEP;
+    let rows = ((no - s) / dlat).ceil() as usize + 1;
+    let cols = ((e - w) / dlon).ceil() as usize + 1;
+    let points: Vec<(f64, f64)> = (0..rows * cols)
+        .map(|k| (s + dlat * (k / cols) as f64, w + dlon * (k % cols) as f64))
+        .collect();
+    let mut heights: Vec<i32> = Vec::with_capacity(points.len());
+    for (n, batch) in points.chunks(100).enumerate() {
+        let list = |f: fn(&(f64, f64)) -> f64| {
+            batch
+                .iter()
+                .map(|p| format!("{:.5}", f(p)))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let url = format!(
+            "https://api.open-meteo.com/v1/elevation?latitude={}&longitude={}",
+            list(|p| p.0),
+            list(|p| p.1)
+        );
+        // Batches already fetched are kept, so a run cut short resumes.
+        let cache =
+            std::env::temp_dir().join(format!("busapp-elevation-{n}-{}.json", points.len()));
+        let body = std::fs::read_to_string(&cache).ok().or_else(|| {
+            // Each coordinate counts against 600 a minute and 5000 an hour.
+            (0..30).find_map(|attempt| {
+                let wait = if attempt == 0 { 11 } else { 120 };
+                std::thread::sleep(std::time::Duration::from_secs(wait));
+                let r = ureq::get(&url)
+                    .header("User-Agent", "busapp-map-refresh")
+                    .call()
+                    .and_then(|mut r| r.body_mut().read_to_string());
+                r.inspect_err(|e| eprintln!("batch {n}: {e}")).ok()
+            })
+        });
+        let body = body.expect("elevation download");
+        let _ = std::fs::write(&cache, &body);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let got = v["elevation"].as_array().unwrap();
+        assert_eq!(got.len(), batch.len());
+        heights.extend(got.iter().map(|h| h.as_f64().unwrap().round() as i32));
+    }
+    let grid = json!([s, w, dlat, dlon, cols, heights]);
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/elevation.json");
+    std::fs::write(path, grid.to_string()).unwrap();
+    eprintln!("{rows} × {cols} heights");
+}

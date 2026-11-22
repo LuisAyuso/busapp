@@ -135,12 +135,9 @@ fn stops(b: &MapBuilder) -> Vec<Option<Point>> {
 pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui, ov: Handle<Overlays>) -> Element {
     let city = city();
     let pin = pin(ui);
-    let near = pin
-        .as_ref()
-        .map(|p| nearest(&city.stops, &city.lines, p.0))
-        .unwrap_or_default();
+    let near = pin.as_ref().map(|p| near(&city, p.0)).unwrap_or_default();
     let marks: Vec<(Point, Color)> = (near.iter().zip(NEAR))
-        .filter_map(|(&(c, _), color)| Some((city.stops[c]?, color)))
+        .filter_map(|(n, color)| Some((city.stops[n.stop]?, color)))
         .collect();
     let at = pin.as_ref().map(|p| p.0);
     // Accuracy in metres while the pin is the phone's position.
@@ -195,9 +192,13 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui, ov: Handle<Overlays>) -> Ele
             }
         });
     let mut panel: Vec<Element> = (near.iter().zip(NEAR))
-        .filter_map(|(&(c, d), color)| {
-            let walk = format!("{} m", (d / 10.0).round() * 10.0);
-            open_stop(h, stops, c, &walk, color)
+        .filter_map(|(n, color)| {
+            let mut walk = format!("{} m", (n.metres / 10.0).round() * 10.0);
+            if n.rise.abs() >= SHOWN_CLIMB {
+                let arrow = if n.rise > 0.0 { '↑' } else { '↓' };
+                walk += &format!(" · {arrow}{} m", n.rise.abs().round());
+            }
+            open_stop(h, stops, n.stop, &walk, color)
         })
         .collect();
     if pin.is_some() {
@@ -286,30 +287,69 @@ pub fn pin_name(ui: &Ui) -> String {
 /// Connections from `a` to the stops closest to the pin, by arrival there
 /// after walking on from the stop.
 pub fn trip_to_pin(stops: &[Stop], ui: &Ui, a: &Stop) -> Element {
-    let trips = near_pin(stops, ui).into_iter();
+    let trips = near_pin(stops, ui, false).into_iter();
     connections(trips.map(|(b, walk)| (a, b, None, Some(walk))).collect())
 }
 
 /// Connections from the stops closest to the pin to `b`, walking to the
 /// stop first, by arrival.
 pub fn trip_from_pin(stops: &[Stop], ui: &Ui, b: &Stop) -> Element {
-    let trips = near_pin(stops, ui).into_iter();
+    let trips = near_pin(stops, ui, true).into_iter();
     connections(trips.map(|(a, walk)| (a, b, Some(walk), None)).collect())
 }
 
-/// The stops closest to the pin and the walk between each and the pin.
-fn near_pin<'a>(stops: &'a [Stop], ui: &Ui) -> Vec<(&'a Stop, crate::plan::Walk)> {
+/// The stops closest to the pin and the walk between each and the pin,
+/// to the stop when `to_stop`, else from it.
+fn near_pin<'a>(stops: &'a [Stop], ui: &Ui, to_stop: bool) -> Vec<(&'a Stop, crate::plan::Walk)> {
     let Some((p, _)) = pin(ui) else {
         return Vec::new();
     };
-    let city = city();
-    (nearest(&city.stops, &city.lines, p).into_iter())
-        .filter_map(|(c, d)| {
-            let name = &network::network().stops[c].0;
+    (near(&city(), p).into_iter())
+        .filter_map(|n| {
+            let name = &network::network().stops[n.stop].0;
             let stop = stops.iter().find(|s| &s.name == name)?;
-            Some((stop, (name.clone(), f64::from(d / WALK_PACE))))
+            Some((stop, (name.clone(), n.minutes(to_stop))))
         })
         .collect()
+}
+
+/// The stops near `p` in the city, by effort including the climb.
+fn near(city: &City, p: Point) -> Vec<Near> {
+    let here = height(p);
+    nearest(&city.stops, &city.lines, p, |i| {
+        city.stops[i].map_or(0.0, |s| height(s) - here)
+    })
+}
+
+/// Ground height at a map point, metres, from the bundled grid (see
+/// `tiles::refresh_elevation`); 0 off the grid.
+fn height(p: Point) -> f32 {
+    /// South, west, rows' and columns' steps in degrees, columns, heights.
+    type Grid = (f64, f64, f64, f64, usize, Vec<f32>);
+    static GRID: std::sync::OnceLock<Grid> = std::sync::OnceLock::new();
+    let (s, w, dlat, dlon, cols, h) = GRID.get_or_init(|| {
+        serde_json::from_str(include_str!("../assets/elevation.json")).expect("elevation.json")
+    });
+    let (lat, lon) = degrees(p);
+    let (y, x) = ((lat - s) / dlat, (lon - w) / dlon);
+    let rows = h.len() / cols;
+    if !(0.0..(rows - 1) as f64).contains(&y) || !(0.0..(cols - 1) as f64).contains(&x) {
+        return 0.0;
+    }
+    let (r, c) = (y as usize, x as usize);
+    let (fy, fx) = ((y - r as f64) as f32, (x - c as f64) as f32);
+    let at = |r: usize, c: usize| h[r * cols + c];
+    let south = at(r, c) * (1.0 - fx) + at(r, c + 1) * fx;
+    let north = at(r + 1, c) * (1.0 - fx) + at(r + 1, c + 1) * fx;
+    south * (1.0 - fy) + north * fy
+}
+
+/// A map point back in degrees, the inverse of `MapBuilder::point`.
+fn degrees(p: Point) -> (f64, f64) {
+    const R: f64 = 6_371_000.0;
+    let lat = CENTER.0 - (f64::from(p[1]) / R).to_degrees();
+    let lon = CENTER.1 + (f64::from(p[0]) / (R * CENTER.0.to_radians().cos())).to_degrees();
+    (lat, lon)
 }
 
 /// The address search: a street, or a street and house number.
@@ -445,24 +485,72 @@ const REACH: f32 = 2.0;
 const MIN_REACH: f32 = 300.0;
 const MAX_REACH: f32 = 1500.0;
 
-/// Up to `NEAR.len()` stops near `p` as (snapshot index, metres): the
-/// closest, then each time the closest that adds a line the ones before
-/// don't serve, then the closest left. Only stops within the reach count,
-/// unless there are none.
-fn nearest(stops: &[Option<Point>], lines: &[Vec<String>], p: Point) -> Vec<(usize, f32)> {
+/// Flat metres a metre of height difference counts as when ranking stops:
+/// a 10 m climb takes about as long as 80 m on the flat (Naismith).
+const CLIMB_WEIGHT: f32 = 8.0;
+/// Minutes a 10 m climb adds to a walk.
+const CLIMB_PACE: f32 = 10.0;
+/// Least height difference worth showing on a stop's button, metres.
+const SHOWN_CLIMB: f32 = 15.0;
+
+/// A stop near a point: its snapshot index, how far it is on the map and
+/// how much higher it lies, metres.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Near {
+    stop: usize,
+    metres: f32,
+    rise: f32,
+}
+
+impl Near {
+    /// What getting there takes, as metres on the flat.
+    fn effort(&self) -> f32 {
+        self.metres + CLIMB_WEIGHT * self.rise.abs()
+    }
+
+    /// Minutes on foot, `up` the stop or down from it.
+    fn minutes(&self, up: bool) -> f64 {
+        let climb = if up { self.rise } else { -self.rise };
+        f64::from(self.metres / WALK_PACE + climb.max(0.0) / CLIMB_PACE)
+    }
+}
+
+/// Up to `NEAR.len()` stops near `p`, by effort: the closest, then each
+/// time the closest that adds a line the ones before don't serve, then the
+/// closest left. Only stops within the reach count, unless there are none.
+/// `rise` gives how much higher a stop lies than `p`.
+fn nearest(
+    stops: &[Option<Point>],
+    lines: &[Vec<String>],
+    p: Point,
+    rise: impl Fn(usize) -> f32,
+) -> Vec<Near> {
     let mut by = (stops.iter().enumerate())
-        .filter_map(|(i, s)| s.map(|s| (i, (s[0] - p[0]).hypot(s[1] - p[1]))))
+        .filter_map(|(i, s)| {
+            let s = (*s)?;
+            let metres = (s[0] - p[0]).hypot(s[1] - p[1]);
+            Some(Near {
+                stop: i,
+                metres,
+                rise: rise(i),
+            })
+        })
         .collect::<Vec<_>>();
-    by.sort_by(|a, b| a.1.total_cmp(&b.1));
-    let gauge = by.get(DENSITY_STOPS - 1).or(by.last()).map_or(0.0, |s| s.1);
+    by.sort_by(|a, b| a.effort().total_cmp(&b.effort()));
+    let gauge = by
+        .get(DENSITY_STOPS - 1)
+        .or(by.last())
+        .map_or(0.0, Near::effort);
     let reach = (REACH * gauge).clamp(MIN_REACH, MAX_REACH);
-    let near = by.partition_point(|s| s.1 <= reach).max(1);
+    let near = by.partition_point(|s| s.effort() <= reach).max(1);
     by.truncate(near);
-    let mut picked: Vec<(usize, f32)> = Vec::new();
+    let mut picked: Vec<Near> = Vec::new();
     while picked.len() < NEAR.len() && !by.is_empty() {
-        let new = |&(i, _): &(usize, f32)| {
-            let served = |l: &String| picked.iter().any(|&(j, _)| lines[j].contains(l));
-            lines.get(i).is_some_and(|ls| ls.iter().any(|l| !served(l)))
+        let new = |n: &Near| {
+            let served = |l: &String| picked.iter().any(|m| lines[m.stop].contains(l));
+            lines
+                .get(n.stop)
+                .is_some_and(|ls| ls.iter().any(|l| !served(l)))
         };
         let k = by.iter().position(new).unwrap_or(0);
         picked.push(by.remove(k));
@@ -518,8 +606,9 @@ mod tests {
             vec!["2".into()],
             vec!["3".into()],
         ];
-        let n = super::nearest(&stops, &lines, [0.0, 0.0]);
-        assert_eq!(n, [(2, 10.0), (3, 50.0), (0, 100.0)]);
+        let n = super::nearest(&stops, &lines, [0.0, 0.0], |_| 0.0);
+        let got: Vec<(usize, f32)> = n.iter().map(|n| (n.stop, n.metres)).collect();
+        assert_eq!(got, [(2, 10.0), (3, 50.0), (0, 100.0)]);
     }
 
     #[test]
@@ -533,13 +622,38 @@ mod tests {
             Some([0.0, 5000.0]),
         ];
         let lines = [line("1"), line("1"), line("1"), line("2"), line("3")];
-        let n = super::nearest(&stops, &lines, [0.0, 0.0]);
+        let n = super::nearest(&stops, &lines, [0.0, 0.0], |_| 0.0);
         // Line 2 comes before the second stop of line 1; line 3 is beyond
         // the reach of a place this dense in stops.
-        let picked: Vec<usize> = n.iter().map(|s| s.0).collect();
+        let picked: Vec<usize> = n.iter().map(|s| s.stop).collect();
         assert_eq!(picked, [0, 3, 1]);
         // Far from everything, the closest still shows.
-        let n = super::nearest(&stops, &lines, [0.0, 30_000.0]);
-        assert_eq!(n.iter().map(|s| s.0).collect::<Vec<_>>(), [4]);
+        let n = super::nearest(&stops, &lines, [0.0, 30_000.0], |_| 0.0);
+        assert_eq!(n.iter().map(|s| s.stop).collect::<Vec<_>>(), [4]);
+    }
+
+    #[test]
+    fn stops_far_below_rank_behind_level_ones() {
+        let line = |l: &str| vec![l.to_owned()];
+        // The closest lies 100 m below, like the valley under Hungerburg.
+        let stops = [Some([0.0, 200.0]), Some([0.0, 600.0])];
+        let lines = [line("1"), line("2")];
+        let rise = |i: usize| if i == 0 { -100.0 } else { 0.0 };
+        let n = super::nearest(&stops, &lines, [0.0, 0.0], rise);
+        assert_eq!(n[0].stop, 1);
+        // Walking back up from it takes 10 minutes more than down to it.
+        let below = n.iter().find(|n| n.stop == 0).unwrap();
+        assert!((below.minutes(false) - below.minutes(true) - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn heights_rise_from_the_old_town_to_hungerburg() {
+        let b = dfui_map::MapBuilder::new(super::CENTER.0, super::CENTER.1);
+        let (town, hungerburg) = (b.point(47.2687, 11.3935), b.point(47.2865, 11.3990));
+        let (low, high) = (super::height(town), super::height(hungerburg));
+        assert!((560.0..610.0).contains(&low), "{low}");
+        assert!((840.0..900.0).contains(&high), "{high}");
+        let (lat, lon) = super::degrees(town);
+        assert!((lat - 47.2687).abs() < 1e-6 && (lon - 11.3935).abs() < 1e-6);
     }
 }
