@@ -205,12 +205,9 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui, ov: Handle<Overlays>) -> Ele
         ]);
         panel.push(trips.gap(6.0).into());
     }
-    let mut head: Vec<Element> = vec![
-        menu_button(h, ov, Color::WHITE),
-        text("Karte").font(Font::BOLD).size(22.0).color(INK).into(),
-    ];
+    let mut head: Vec<Element> = vec![menu_button(h, ov, Color::WHITE)];
     match &pin {
-        Some((_, Some(name))) => head.push(text(name).size(16.0).color(MUTED).shrink(1.0).into()),
+        Some((_, Some(name))) => head.push(text(name).size(17.0).color(INK).shrink(1.0).into()),
         None if ui.locating => {
             let wait = text("Standort wird gesucht…").size(16.0).color(MUTED);
             head.push(wait.shrink(1.0).into());
