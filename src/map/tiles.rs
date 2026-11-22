@@ -129,6 +129,10 @@ fn add(b: &mut MapBuilder, s: &Style, names: &mut Vec<Name>, e: &Value) {
         "" => None,
         _ => Some((s.paths, 2.5)),
     };
+    // One carriageway of a dual one, mapped as its own way beside the other.
+    let major = ["motorway", "trunk", "primary", "secondary", "tertiary"];
+    let split = tag("oneway") == "yes" && major.contains(&tag("highway"));
+    let road = road.map(|(l, w)| (l, if split { w * 0.6 } else { w }));
     let line = road.or(match tag("waterway") {
         "river" => Some((s.water, 20.0)),
         "canal" => Some((s.water, 10.0)),
@@ -302,8 +306,9 @@ fn refresh_map() {
         },
         3,
     );
-    const KEEP: [&str; 8] = [
+    const KEEP: [&str; 9] = [
         "name", "building", "highway", "railway", "waterway", "natural", "leisure", "landuse",
+        "oneway",
     ];
     let geometry = |g: &Value| -> Value {
         let round = |v: &Value| (v.as_f64().unwrap_or(0.0) * 1e6).round() / 1e6;
