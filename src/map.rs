@@ -66,6 +66,8 @@ fn project((lat, lon, _): gps::Fix) -> Point {
 struct City {
     data: Rc<MapData>,
     stops: Vec<Option<Point>>,
+    /// The lines serving each stop.
+    lines: Vec<Vec<String>>,
     /// Street names and a point along each.
     streets: Vec<(String, Point)>,
     /// Street, house number, point; by street, then number.
@@ -100,9 +102,24 @@ fn load() -> City {
     City {
         data: Rc::new(data.expect("innsbruck.map")),
         stops: stops(&b),
+        lines: lines(),
         streets: streets.expect("streets.json"),
         addresses,
     }
+}
+
+/// The lines serving each snapshot stop.
+fn lines() -> Vec<Vec<String>> {
+    let net = network::network();
+    let mut lines = vec![Vec::new(); net.stops.len()];
+    for (line, a, b, _) in &net.edges {
+        for s in [*a, *b] {
+            if !lines[s].contains(line) {
+                lines[s].push(line.clone());
+            }
+        }
+    }
+    lines
 }
 
 /// Where each snapshot stop lies on the map; None without coordinates.
@@ -120,7 +137,7 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui, ov: Handle<Overlays>) -> Ele
     let pin = pin(ui);
     let near = pin
         .as_ref()
-        .map(|p| nearest(&city.stops, p.0))
+        .map(|p| nearest(&city.stops, &city.lines, p.0))
         .unwrap_or_default();
     let marks: Vec<(Point, Color)> = (near.iter().zip(NEAR))
         .filter_map(|(&(c, _), color)| Some((city.stops[c]?, color)))
@@ -285,7 +302,8 @@ fn near_pin<'a>(stops: &'a [Stop], ui: &Ui) -> Vec<(&'a Stop, crate::plan::Walk)
     let Some((p, _)) = pin(ui) else {
         return Vec::new();
     };
-    (nearest(&city().stops, p).into_iter())
+    let city = city();
+    (nearest(&city.stops, &city.lines, p).into_iter())
         .filter_map(|(c, d)| {
             let name = &network::network().stops[c].0;
             let stop = stops.iter().find(|s| &s.name == name)?;
@@ -418,14 +436,38 @@ fn crosshair() -> Shape {
     Shape::new(path, Rect::new(0.0, 0.0, 24.0, 24.0))
 }
 
-/// The closest stops to `p` as (snapshot index, metres), closest first.
-fn nearest(stops: &[Option<Point>], p: Point) -> Vec<(usize, f32)> {
+/// Stops counted to gauge how dense they are around a point.
+const DENSITY_STOPS: usize = 3;
+/// How far the stops are looked for, as a multiple of the distance to the
+/// [`DENSITY_STOPS`]th closest, between these bounds in metres: a few blocks
+/// downtown, further where stops are sparse.
+const REACH: f32 = 2.0;
+const MIN_REACH: f32 = 300.0;
+const MAX_REACH: f32 = 1500.0;
+
+/// Up to `NEAR.len()` stops near `p` as (snapshot index, metres): the
+/// closest, then each time the closest that adds a line the ones before
+/// don't serve, then the closest left. Only stops within the reach count,
+/// unless there are none.
+fn nearest(stops: &[Option<Point>], lines: &[Vec<String>], p: Point) -> Vec<(usize, f32)> {
     let mut by = (stops.iter().enumerate())
         .filter_map(|(i, s)| s.map(|s| (i, (s[0] - p[0]).hypot(s[1] - p[1]))))
         .collect::<Vec<_>>();
     by.sort_by(|a, b| a.1.total_cmp(&b.1));
-    by.truncate(NEAR.len());
-    by
+    let gauge = by.get(DENSITY_STOPS - 1).or(by.last()).map_or(0.0, |s| s.1);
+    let reach = (REACH * gauge).clamp(MIN_REACH, MAX_REACH);
+    let near = by.partition_point(|s| s.1 <= reach).max(1);
+    by.truncate(near);
+    let mut picked: Vec<(usize, f32)> = Vec::new();
+    while picked.len() < NEAR.len() && !by.is_empty() {
+        let new = |&(i, _): &(usize, f32)| {
+            let served = |l: &String| picked.iter().any(|&(j, _)| lines[j].contains(l));
+            lines.get(i).is_some_and(|ls| ls.iter().any(|l| !served(l)))
+        };
+        let k = by.iter().position(new).unwrap_or(0);
+        picked.push(by.remove(k));
+    }
+    picked
 }
 
 #[cfg(test)]
@@ -470,7 +512,34 @@ mod tests {
             Some([0.0, 10.0]),
             Some([50.0, 0.0]),
         ];
-        let n = super::nearest(&stops, [0.0, 0.0]);
+        let lines = vec![
+            vec!["1".to_owned()],
+            vec![],
+            vec!["2".into()],
+            vec!["3".into()],
+        ];
+        let n = super::nearest(&stops, &lines, [0.0, 0.0]);
         assert_eq!(n, [(2, 10.0), (3, 50.0), (0, 100.0)]);
+    }
+
+    #[test]
+    fn nearest_stops_vary_their_lines_within_reach() {
+        let line = |l: &str| vec![l.to_owned()];
+        let stops = [
+            Some([0.0, 100.0]),
+            Some([0.0, 120.0]),
+            Some([0.0, 150.0]),
+            Some([0.0, 250.0]),
+            Some([0.0, 5000.0]),
+        ];
+        let lines = [line("1"), line("1"), line("1"), line("2"), line("3")];
+        let n = super::nearest(&stops, &lines, [0.0, 0.0]);
+        // Line 2 comes before the second stop of line 1; line 3 is beyond
+        // the reach of a place this dense in stops.
+        let picked: Vec<usize> = n.iter().map(|s| s.0).collect();
+        assert_eq!(picked, [0, 3, 1]);
+        // Far from everything, the closest still shows.
+        let n = super::nearest(&stops, &lines, [0.0, 30_000.0]);
+        assert_eq!(n.iter().map(|s| s.0).collect::<Vec<_>>(), [4]);
     }
 }
