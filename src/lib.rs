@@ -7,10 +7,11 @@ use dfui::taffy::{AlignItems, JustifyContent};
 use dfui::widgets::{
     Container, Overlays, Shown, Snapshot, Styled, button, column, container, drawer,
     future_builder, on_back, overlays, row, scroll, spacer, stateful, stream_builder, text,
-    text_input,
+    text_input, watch,
 };
 use dfui::{App, Color, Element, Font, Handle};
 
+mod gps;
 mod lines;
 mod map;
 mod network;
@@ -185,8 +186,12 @@ struct Ui {
     /// Stop the network view is centred on, by snapshot index.
     center: Option<usize>,
     pin: Option<map::Pin>,
+    /// The pin follows the phone's position.
+    locating: bool,
     /// Start of a trip to the pin.
     from_stop: Option<Stop>,
+    /// End of a trip from the pin.
+    to_stop: Option<Stop>,
     /// Where the map centres, set by an address search.
     focus: Option<dfui::path::Point>,
     /// The address search over the map is open.
@@ -201,6 +206,8 @@ enum Pick {
     To,
     /// Picking where a trip to the map's pin starts.
     ToPin,
+    /// Picking where a trip from the map's pin goes.
+    FromPin,
 }
 
 /// Lines the network view shows until toggled.
@@ -227,7 +234,9 @@ impl Default for Ui {
             dir: 0,
             center: None,
             pin: None,
+            locating: false,
             from_stop: None,
+            to_stop: None,
             focus: None,
             finding: false,
             address: String::new(),
@@ -238,17 +247,21 @@ impl Default for Ui {
 /// What the burger menu switches between.
 #[derive(Default, Clone, Copy, PartialEq)]
 enum Screen {
-    #[default]
     Stops,
     Network,
     Lines,
+    #[default]
     Map,
 }
 
 fn screen(stops: Rc<Vec<Stop>>) -> Element {
-    overlays(move |ov| screen_in(stops.clone(), ov))
-        .fill()
-        .into()
+    // Rebuilt on each GPS fix, for the map's position pin.
+    overlays(move |ov| {
+        let stops = stops.clone();
+        watch(&gps::CHANGED, move || screen_in(stops.clone(), ov)).fill()
+    })
+    .fill()
+    .into()
 }
 
 fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
@@ -258,7 +271,7 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                 h,
                 &format!("{} → {}", a.name, b.name),
                 Some(|u| u.to = None),
-                [connections(a, vec![(b, None)])],
+                [connections(vec![(a, b, None, None)])],
             ),
             (Some(a), None) if ui.picking.is_some() => page(
                 h,
@@ -301,7 +314,7 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                         ui.center
                             .and_then(|c| open_stop(h, &stops, c, "Abfahrten", ACCENT)),
                     );
-                    page(h, "Liniennetz", Some(|u| u.screen = Screen::Stops), body)
+                    page(h, "Liniennetz", Some(|u| u.screen = Screen::Map), body)
                 }
                 (Screen::Lines, Some(l)) => page(
                     h,
@@ -319,6 +332,15 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                         u.from_stop = Some(s);
                     }),
                 ),
+                (Screen::Map, _) if ui.picking == Some(Pick::FromPin) => page(
+                    h,
+                    &format!("Von {} nach…", map::pin_name(ui)),
+                    Some(|u| u.picking = None),
+                    search(&stops, &ui.query, h, |u, s| {
+                        u.picking = None;
+                        u.to_stop = Some(s);
+                    }),
+                ),
                 (Screen::Map, _) if ui.from_stop.is_some() => {
                     let a = ui.from_stop.as_ref().unwrap();
                     page(
@@ -328,18 +350,28 @@ fn screen_in(stops: Rc<Vec<Stop>>, ov: Handle<Overlays>) -> Element {
                         [map::trip_to_pin(&stops, ui, a)],
                     )
                 }
-                (Screen::Map, _) => map::page(h, &stops, ui),
+                (Screen::Map, _) if ui.to_stop.is_some() => {
+                    let b = ui.to_stop.as_ref().unwrap();
+                    page(
+                        h,
+                        &format!("{} → {}", map::pin_name(ui), b.name),
+                        Some(|u| u.to_stop = None),
+                        [map::trip_from_pin(&stops, ui, b)],
+                    )
+                }
+                (Screen::Map, _) => map::page(h, &stops, ui, ov),
                 (Screen::Lines, None) => page(
                     h,
                     "Linien",
-                    Some(|u| u.screen = Screen::Stops),
+                    Some(|u| u.screen = Screen::Map),
                     [lines::all(h)],
                 ),
-                (Screen::Stops, _) => {
-                    let mut body = vec![menu_button(h, ov)];
-                    body.extend(search(&stops, &ui.query, h, |u, s| u.stop = Some(s)));
-                    page(h, "Innsbruck Bus", None, body)
-                }
+                (Screen::Stops, _) => page(
+                    h,
+                    "Haltestellen",
+                    Some(|u| u.screen = Screen::Map),
+                    search(&stops, &ui.query, h, |u, s| u.stop = Some(s)),
+                ),
             },
         }
     })
@@ -463,7 +495,7 @@ fn open_stop(h: Handle<Ui>, stops: &[Stop], c: usize, note: &str, color: Color) 
     Some(open.into())
 }
 
-fn menu_button(h: Handle<Ui>, ov: Handle<Overlays>) -> Element {
+fn menu_button(h: Handle<Ui>, ov: Handle<Overlays>, bg: Color) -> Element {
     let bar = || -> Element {
         container(spacer())
             .width(20.0)
@@ -474,7 +506,7 @@ fn menu_button(h: Handle<Ui>, ov: Handle<Overlays>) -> Element {
     };
     button(column([bar(), bar(), bar()]).gap(4.0))
         .flat()
-        .color(BG)
+        .color(bg)
         .on_click(move |cx| ov.show(cx, move |me| drawer(menu(h, me))))
         .into()
 }
@@ -548,19 +580,21 @@ fn line_filters(h: Handle<Ui>, hidden: &HashSet<String>) -> Element {
 
 /// Direct and one-change connections, refreshed like departures.
 /// Connections from `a` to any of `to`, each with the walk after it.
-fn connections(a: &Stop, to: Vec<(&Stop, Option<plan::Walk>)>) -> Element {
-    let to: Result<Vec<(i64, Option<plan::Walk>)>, _> = (to.into_iter())
-        .map(|(b, walk)| b.uid.parse::<i64>().map(|b| (b, walk)))
+/// The best connections over `trips`: from one stop to another, each with
+/// the walk to the first and on from the last.
+fn connections(trips: Vec<(&Stop, &Stop, Option<plan::Walk>, Option<plan::Walk>)>) -> Element {
+    let trips: Result<Vec<plan::Trip>, std::num::ParseIntError> = (trips.into_iter())
+        .map(|(a, b, lead, walk)| Ok((a.uid.parse()?, b.uid.parse()?, lead, walk)))
         .collect();
-    let (Ok(a), Ok(to)) = (a.uid.parse::<i64>(), to) else {
+    let Ok(trips) = trips else {
         return message("Unbekannte Haltestelle.");
     };
-    let ids: Vec<i64> = to.iter().map(|t| t.0).collect();
+    let ids: Vec<(i64, i64)> = trips.iter().map(|t| (t.0, t.1)).collect();
     stream_builder(
-        (a, ids),
+        ids,
         move |_| {
             poll(
-                move || plan::fetch_to(a, &to),
+                move || plan::fetch_all(&trips),
                 |r| Some(if r.is_ok() { REFRESH } else { RETRY }),
             )
         },
@@ -596,7 +630,7 @@ fn connection(now: Option<f64>, c: &plan::Connection) -> Element {
     lines.push(
         text(format!(
             "{} → {}{}",
-            plan::clock(now, c.dep()),
+            plan::clock(now, c.leave()),
             if c.estimated() { "~" } else { "" },
             plan::clock(now, c.at())
         ))
@@ -605,22 +639,28 @@ fn connection(now: Option<f64>, c: &plan::Connection) -> Element {
         .color(INK)
         .into(),
     );
-    let mut rows: Vec<Element> = vec![
-        row(lines).align(AlignItems::CENTER).gap(6.0).into(),
-        text(format!(
-            "{}Steig {} · {} min Fahrt",
-            if c.dep() < 60.0 {
-                format!("Abfahrt in {} min · ", c.dep().round())
-            } else {
-                String::new()
-            },
-            first.platform,
-            (c.arr() - c.dep()).round()
-        ))
-        .size(13.0)
-        .color(MUTED)
-        .into(),
-    ];
+    let mut rows: Vec<Element> = vec![row(lines).align(AlignItems::CENTER).gap(6.0).into()];
+    if let Some((stop, minutes)) = &c.lead {
+        rows.push(
+            text(format!("{} min zu Fuß zu {stop}", minutes.round()))
+                .size(13.0)
+                .color(MUTED)
+                .into(),
+        );
+    }
+    rows.extend([text(format!(
+        "{}Steig {} · {} min Fahrt",
+        if c.dep() < 60.0 {
+            format!("Abfahrt in {} min · ", c.dep().round())
+        } else {
+            String::new()
+        },
+        first.platform,
+        (c.arr() - c.dep()).round()
+    ))
+    .size(13.0)
+    .color(MUTED)
+    .into()]);
     if let Some((stop, minutes)) = &c.walk {
         rows.push(
             text(format!("Ab {stop} {} min zu Fuß", minutes.round()))
@@ -822,6 +862,7 @@ fn android_main(app: dfui::AndroidApp) {
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
+    let _ = gps::APP.set(app.clone());
     dfui::run_android(Bus, app);
 }
 

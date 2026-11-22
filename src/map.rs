@@ -9,15 +9,16 @@ use std::rc::Rc;
 
 use dfui::path::Point;
 use dfui::taffy::{AlignItems, JustifyContent};
+use dfui::widgets::Overlays;
 use dfui::widgets::{
-    Styled, button, column, container, icon_button, on_back, overlay, row, scroll, spacer, text,
-    text_input,
+    Styled, button, column, container, icon_button, overlay, row, scroll, spacer, text, text_input,
 };
 use dfui::{Color, Element, Font, Handle, Path, Rect, Shadow, Shape};
 use dfui_map::{MapBuilder, MapData, map};
 
 use crate::{
-    ACCENT, INK, MAX_ROWS, MUTED, Pick, Stop, Ui, connections, network, open_stop, page_with,
+    ACCENT, INK, MAX_ROWS, MUTED, Pick, Stop, Ui, connections, gps, menu_button, network,
+    open_stop, page_with,
 };
 
 /// Origin of the map's metres, degrees: the old town.
@@ -43,6 +44,22 @@ const NEAR: [Color; 3] = [
 
 /// The dropped pin and the address or street it names, if any.
 pub type Pin = (Point, Option<String>);
+/// What the pin is called while it follows the phone.
+const HERE: &str = "Mein Standort";
+const ME: Color = Color::hex(0x1a73e8);
+
+/// The pin: the phone's position while locating, else where it was dropped.
+pub fn pin(ui: &Ui) -> Option<Pin> {
+    match ui.locating {
+        true => gps::fix().map(|f| (project(f), Some(HERE.into()))),
+        false => ui.pin.clone(),
+    }
+}
+
+/// A GPS fix in map metres.
+fn project((lat, lon, _): gps::Fix) -> Point {
+    MapBuilder::new(CENTER.0, CENTER.1).point(lat, lon)
+}
 
 /// The map, where each snapshot stop lies on it (None without coordinates),
 /// and the places a search finds.
@@ -98,9 +115,9 @@ fn stops(b: &MapBuilder) -> Vec<Option<Point>> {
 /// The Karte page: the map with the city lines and stops, and a search
 /// button by the title. A tap or a search drops a pin, names it after the
 /// title and lists the closest stops, marked on the map in their colors.
-pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui) -> Element {
+pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui, ov: Handle<Overlays>) -> Element {
     let city = city();
-    let pin = ui.pin.clone();
+    let pin = pin(ui);
     let near = pin
         .as_ref()
         .map(|p| nearest(&city.stops, p.0))
@@ -109,14 +126,21 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui) -> Element {
         .filter_map(|(&(c, _), color)| Some((city.stops[c]?, color)))
         .collect();
     let at = pin.as_ref().map(|p| p.0);
+    // Accuracy in metres while the pin is the phone's position.
+    let me = gps::fix().filter(|_| ui.locating).map(|f| f.2);
+    let focus = match ui.locating {
+        true => gps::first().map(project),
+        false => ui.focus,
+    };
     let tapped = city.clone();
     let m = map(&city.data)
         .start([0.0, 0.0], START_SCALE)
-        .focus(ui.focus.map(|p| (p, FOUND_SCALE)))
+        .focus(focus.map(|p| (p, FOUND_SCALE)))
         .on_tap(move |cx, p| {
             let name = closest_address(&tapped.addresses, p);
+            gps::stop();
             cx.update(h, move |u: &mut Ui| {
-                (u.pin, u.focus) = (Some((p, name)), None)
+                (u.pin, u.focus, u.locating) = (Some((p, name)), None, false)
             })
         })
         .overlay(move |cx, to_px| {
@@ -137,7 +161,13 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui) -> Element {
                 cx.fill(Rect::new(x - 10.0, y - 10.0, 20.0, 20.0), 10.0, color);
                 cx.fill(Rect::new(x - 4.0, y - 4.0, 8.0, 8.0), 4.0, Color::WHITE);
             }
-            if let Some(p) = at {
+            if let (Some(p), Some(acc)) = (at, me) {
+                let [x, y] = to_px(p);
+                let r = (to_px([p[0] + acc, p[1]])[0] - x).max(9.0);
+                cx.fill(Rect::new(x - r, y - r, 2.0 * r, 2.0 * r), r, ME.alpha(0.15));
+                cx.fill(Rect::new(x - 9.0, y - 9.0, 18.0, 18.0), 9.0, Color::WHITE);
+                cx.fill(Rect::new(x - 6.5, y - 6.5, 13.0, 13.0), 6.5, ME);
+            } else if let Some(p) = at {
                 let [x, y] = to_px(p);
                 cx.path(
                     &Path::polygon(&[[x - 7.0, y - 18.0], [x, y], [x + 7.0, y - 18.0]]),
@@ -154,39 +184,59 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui) -> Element {
         })
         .collect();
     if pin.is_some() {
-        let go = button(text("Fahrt hierher").color(Color::WHITE))
-            .color(ACCENT)
-            .on_click(move |cx| {
-                cx.update(h, |u: &mut Ui| {
-                    u.picking = Some(Pick::ToPin);
-                    u.query.clear();
+        let trip = |label: &str, pick: Pick| -> Element {
+            button(text(label).color(Color::WHITE))
+                .color(ACCENT)
+                .grow(1.0)
+                .on_click(move |cx| {
+                    gps::stop();
+                    cx.update(h, move |u: &mut Ui| {
+                        // A trip keeps the position the pin had.
+                        (u.pin, u.locating) = (self::pin(u), false);
+                        u.picking = Some(pick);
+                        u.query.clear();
+                    })
                 })
-            });
-        panel.push(go.into());
+                .into()
+        };
+        let trips = row([
+            trip("Fahrt von hier", Pick::FromPin),
+            trip("Fahrt hierher", Pick::ToPin),
+        ]);
+        panel.push(trips.gap(6.0).into());
     }
-    let back = |u: &mut Ui| u.screen = Default::default();
     let mut head: Vec<Element> = vec![
-        button(text("‹").size(24.0).color(INK))
-            .flat()
-            .color(Color::WHITE)
-            .on_click(move |cx| cx.update(h, back))
-            .into(),
+        menu_button(h, ov, Color::WHITE),
         text("Karte").font(Font::BOLD).size(22.0).color(INK).into(),
     ];
-    if let Some((_, Some(name))) = &pin {
-        head.push(text(name).size(16.0).color(MUTED).shrink(1.0).into());
+    match &pin {
+        Some((_, Some(name))) => head.push(text(name).size(16.0).color(MUTED).shrink(1.0).into()),
+        None if ui.locating => {
+            let wait = text("Standort wird gesucht…").size(16.0).color(MUTED);
+            head.push(wait.shrink(1.0).into());
+        }
+        _ => {}
+    }
+    head.push(spacer().grow(1.0).into());
+    if gps::AVAILABLE {
+        let locate = icon_button(&crosshair())
+            .color(if ui.locating { ME } else { INK })
+            .on_click(move |cx| {
+                gps::start();
+                cx.update(h, |u: &mut Ui| (u.locating, u.focus) = (true, None))
+            });
+        head.push(locate.into());
     }
     let find = icon_button(&magnifier())
         .color(INK)
         .on_click(move |cx| cx.update(h, |u: &mut Ui| u.finding = true));
-    head.extend([spacer().grow(1.0).into(), find.into()]);
+    head.push(find.into());
     let head = row(head)
         .align(AlignItems::CENTER)
         .gap(6.0)
         .padding_xy(4.0, 2.0);
     // Overlays take taps on their content, so those don't drop a pin.
     let mut layers = vec![
-        on_back(move |cx| cx.update(h, back)).into(),
         container(m).bg(LAND).grow(1.0).into(),
         overlay(card(head.into())).padding(12.0).into(),
     ];
@@ -215,26 +265,36 @@ fn card(e: Element) -> Element {
 
 /// What the pin is called in titles.
 pub fn pin_name(ui: &Ui) -> String {
-    let name = ui.pin.as_ref().and_then(|p| p.1.clone());
+    let name = pin(ui).and_then(|p| p.1);
     name.unwrap_or_else(|| "Markierung".into())
 }
 
 /// Connections from `a` to the stops closest to the pin, by arrival there
 /// after walking on from the stop.
 pub fn trip_to_pin(stops: &[Stop], ui: &Ui, a: &Stop) -> Element {
-    let city = city();
-    let Some((p, _)) = &ui.pin else {
-        return text("Keine Markierung.").into();
+    let trips = near_pin(stops, ui).into_iter();
+    connections(trips.map(|(b, walk)| (a, b, None, Some(walk))).collect())
+}
+
+/// Connections from the stops closest to the pin to `b`, walking to the
+/// stop first, by arrival.
+pub fn trip_from_pin(stops: &[Stop], ui: &Ui, b: &Stop) -> Element {
+    let trips = near_pin(stops, ui).into_iter();
+    connections(trips.map(|(a, walk)| (a, b, Some(walk), None)).collect())
+}
+
+/// The stops closest to the pin and the walk between each and the pin.
+fn near_pin<'a>(stops: &'a [Stop], ui: &Ui) -> Vec<(&'a Stop, crate::plan::Walk)> {
+    let Some((p, _)) = pin(ui) else {
+        return Vec::new();
     };
-    let near = nearest(&city.stops, *p);
-    let to = (near.iter())
-        .filter_map(|&(c, d)| {
+    (nearest(&city().stops, p).into_iter())
+        .filter_map(|(c, d)| {
             let name = &network::network().stops[c].0;
             let stop = stops.iter().find(|s| &s.name == name)?;
-            Some((stop, Some((name.clone(), f64::from(d / WALK_PACE)))))
+            Some((stop, (name.clone(), f64::from(d / WALK_PACE))))
         })
-        .collect();
-    connections(a, to)
+        .collect()
 }
 
 /// The address search: a street, or a street and house number.
@@ -328,6 +388,36 @@ fn magnifier() -> Shape {
     path.contours.extend(Path::polygon(&inner).contours);
     let handle = [[14.6, 13.2], [21.5, 20.1], [20.1, 21.5], [13.2, 14.6]];
     path.contours.extend(Path::polygon(&handle).contours);
+    Shape::new(path, Rect::new(0.0, 0.0, 24.0, 24.0))
+}
+
+/// A crosshair, 24 units square: a ring with a dot and four ticks.
+fn crosshair() -> Shape {
+    let ring = |r: f32, back: bool| -> Vec<Point> {
+        let pts = (0..24).map(|i| {
+            let a = i as f32 * std::f32::consts::TAU / 24.0;
+            [12.0 + r * a.cos(), 12.0 + r * a.sin()]
+        });
+        match back {
+            true => pts.rev().collect(),
+            false => pts.collect(),
+        }
+    };
+    let mut path = Path::polygon(&ring(7.5, false));
+    // The inner edge runs the other way, so the ring stays hollow.
+    path.contours
+        .extend(Path::polygon(&ring(5.5, true)).contours);
+    path.contours
+        .extend(Path::polygon(&ring(2.5, false)).contours);
+    for [x, y, w, h] in [
+        [11.0, 1.0, 2.0, 4.0],
+        [11.0, 19.0, 2.0, 4.0],
+        [1.0, 11.0, 4.0, 2.0],
+        [19.0, 11.0, 4.0, 2.0],
+    ] {
+        path.contours
+            .extend(Path::polygon(&[[x, y], [x + w, y], [x + w, y + h], [x, y + h]]).contours);
+    }
     Shape::new(path, Rect::new(0.0, 0.0, 24.0, 24.0))
 }
 

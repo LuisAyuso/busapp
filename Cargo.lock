@@ -224,6 +224,7 @@ dependencies = [
  "dfui",
  "dfui-map",
  "futures-channel",
+ "jni",
  "log",
  "serde",
  "serde_json",

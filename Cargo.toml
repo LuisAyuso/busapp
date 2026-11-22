@@ -16,6 +16,7 @@ ureq = "3.5"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"
+jni = "0.22"
 log = "0.4"
 
 [package.metadata.android]
@@ -34,6 +35,12 @@ icon = "@mipmap/ic_launcher"
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_FINE_LOCATION"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_COARSE_LOCATION"
 
 [profile.dev.package."*"]
 opt-level = 3
