@@ -11,7 +11,8 @@ use dfui::path::Point;
 use dfui::taffy::{AlignItems, JustifyContent};
 use dfui::widgets::Overlays;
 use dfui::widgets::{
-    Styled, button, column, container, icon_button, overlay, row, scroll, spacer, text, text_input,
+    Styled, backdrop, button, column, container, icon_button, row, screen, scroll, spacer, text,
+    text_input,
 };
 use dfui::{Color, Element, Font, Handle, Path, Rect, Shadow, Shape};
 use dfui_map::{MapBuilder, MapData, map};
@@ -33,6 +34,9 @@ const LAND: Color = Color::hex(0xf2efe9);
 const WALK_PACE: f32 = 60.0;
 const CREDIT: &str = "© OpenStreetMap contributors";
 const CREDIT_HEIGHT: f32 = 18.0;
+/// Opacity of the white bands under the card and the buttons: faint, so the
+/// map reads through them.
+const BAND_ALPHA: f32 = 0.3;
 /// A tap names the closest address within this many metres.
 const ADDRESS_REACH: f32 = 60.0;
 /// The closest stops to the pin, one color each, on the map and their buttons.
@@ -160,7 +164,10 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui, ov: Handle<Overlays>) -> Ele
         .overlay(move |cx, to_px| {
             let r = cx.rect;
             let w = cx.measure(CREDIT, Font::DEFAULT, 11.0, None).width;
-            let back = Rect::new(r.x, r.y + r.h - CREDIT_HEIGHT, w + 10.0, CREDIT_HEIGHT);
+            // Above the navigation bar the map runs under.
+            let [_, _, bottom, left] = dfui::insets();
+            let y = r.y + r.h - bottom - CREDIT_HEIGHT;
+            let back = Rect::new(r.x + left, y, w + 10.0, CREDIT_HEIGHT);
             cx.fill(back, 0.0, Color::WHITE.alpha(0.7));
             cx.text(
                 CREDIT,
@@ -168,7 +175,7 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui, ov: Handle<Overlays>) -> Ele
                 11.0,
                 INK,
                 None,
-                (r.x + 5.0, back.y + 2.0),
+                (back.x + 5.0, back.y + 2.0),
             );
             for &(p, color) in &marks {
                 let [x, y] = to_px(p);
@@ -250,16 +257,30 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui, ov: Handle<Overlays>) -> Ele
         .align(AlignItems::CENTER)
         .gap(6.0)
         .padding_xy(4.0, 2.0);
-    // Overlays take taps on their content, so those don't drop a pin.
+    // The map fills the screen, under the system bars too; the card and the
+    // buttons sit on faint bands that reach the screen's edges. Layers take
+    // taps on their content, so those don't drop a pin.
+    let [top, right, bottom, left] = dfui::insets();
+    // Padded clear of the bars by [top, bottom] beyond 12 px.
+    let band = |e: Element, [t, b]: [f32; 2]| {
+        let mut c = container(e).bg(Color::WHITE.alpha(BAND_ALPHA));
+        let px = dfui::taffy::LengthPercentage::length;
+        c.style_mut().padding = dfui::taffy::Rect {
+            top: px(12.0 + t),
+            right: px(12.0 + right),
+            bottom: px(12.0 + b),
+            left: px(12.0 + left),
+        };
+        c
+    };
+    let head = band(card(head.into()), [top, 0.0]);
     let mut layers = vec![
-        container(m).bg(LAND).grow(1.0).into(),
-        overlay(card(head.into())).padding(12.0).into(),
+        backdrop(container(m).bg(LAND).grow(1.0)).into(),
+        screen(head).into(),
     ];
     if !panel.is_empty() {
-        let panel = overlay(column(panel).gap(6.0))
-            .justify(JustifyContent::END)
-            .padding_xy(12.0, CREDIT_HEIGHT + 8.0);
-        layers.push(panel.into());
+        let panel = band(column(panel).gap(6.0).into(), [0.0, bottom + CREDIT_HEIGHT]);
+        layers.push(screen(panel).justify(JustifyContent::END).into());
     }
     column(layers).fill().into()
 }
