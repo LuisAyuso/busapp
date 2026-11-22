@@ -78,8 +78,27 @@ struct PassageEntry {
     smartinfo: Option<Passage>,
 }
 
+/// Longest a request may take before it fails and its caller retries; a
+/// connection the server stalls must not leave a page waiting forever.
+const TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .build()
+        .into()
+}
+
 fn get_text(url: &str) -> Result<String, String> {
-    ureq::get(url)
+    static AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| agent(TIMEOUT));
+    get_with(&AGENT, url)
+}
+
+fn get_with(agent: &ureq::Agent, url: &str) -> Result<String, String> {
+    agent
+        .get(url)
         .call()
         .and_then(|mut r| r.body_mut().read_to_string())
         .map_err(|e| e.to_string())
@@ -99,15 +118,17 @@ pub fn parse_passages(json: &str) -> Result<Vec<Passage>, String> {
 }
 
 /// Calls `fetch` on a thread and streams each result; `again` picks the delay
-/// before the next call, or stops. Dropping the receiver ends the thread.
+/// before the next call, or stops. Dropping the receiver ends the thread;
+/// `fetch` gets a check of whether the result is still wanted, so a long one
+/// can stop early.
 fn poll<T: Send + 'static>(
-    fetch: impl Fn() -> Result<T, String> + Send + 'static,
+    fetch: impl Fn(plan::Wanted) -> Result<T, String> + Send + 'static,
     again: impl Fn(&Result<T, String>) -> Option<Duration> + Send + 'static,
 ) -> mpsc::UnboundedReceiver<Result<T, String>> {
     let (tx, rx) = mpsc::unbounded();
     std::thread::spawn(move || {
         loop {
-            let r = fetch();
+            let r = fetch(&|| !tx.is_closed());
             let wait = again(&r);
             if tx.unbounded_send(r).is_err() {
                 return;
@@ -146,7 +167,7 @@ impl App for Bus {
             (),
             |_| {
                 poll(
-                    || {
+                    |_| {
                         let mut s: Vec<Stop> = get::<Vec<StopEntry>>(&format!("{API}/STOPS"))?
                             .into_iter()
                             .map(|e| e.stop)
@@ -594,7 +615,7 @@ fn connections(trips: Vec<(&Stop, &Stop, Option<plan::Walk>, Option<plan::Walk>)
         ids,
         move |_| {
             poll(
-                move || plan::fetch_all(&trips),
+                move |wanted| plan::fetch_all(&trips, wanted),
                 |r| Some(if r.is_ok() { REFRESH } else { RETRY }),
             )
         },
@@ -752,7 +773,7 @@ fn departures(uid: String) -> Element {
         uid.clone(),
         move |_| {
             poll(
-                move || {
+                move |_| {
                     let ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_millis());
@@ -869,6 +890,20 @@ fn android_main(app: dfui::AndroidApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_that_never_answers_fails_the_request() {
+        // Accepts the connection, then says nothing.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", server.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let _conn = server.accept();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let t = std::time::Instant::now();
+        assert!(get_with(&agent(Duration::from_millis(500)), &url).is_err());
+        assert!(t.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn passages_skip_non_departures() {

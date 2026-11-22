@@ -340,12 +340,19 @@ fn vias(from: &[Line], to: &[Line], mid: &[(&str, &str, Vec<&str>)]) -> Vec<Via>
 }
 
 /// Fetches the timetables of `a`, `b` and the likely change stops, then plans.
-pub fn fetch(a: i64, b: i64) -> Result<Plan, String> {
+pub fn fetch(a: i64, b: i64, wanted: Wanted) -> Result<Plan, String> {
+    let gone = || (!wanted()).then(|| Err("no longer wanted".to_owned()));
+    if let Some(e) = gone() {
+        return e;
+    }
     let (from, to) = std::thread::scope(|s| {
         let to = s.spawn(|| timetable(b));
         (timetable(a), to.join().unwrap_or(Err("panicked".into())))
     });
     let (from, mut to) = (from?, to?);
+    if let Some(e) = gone() {
+        return e;
+    }
     if let Some(b) = queried(&to).map(str::to_owned) {
         let extra: Vec<Line> = timetables(terminus_neighbours(&b, &from, &to))
             .iter()
@@ -369,6 +376,9 @@ pub fn fetch(a: i64, b: i64) -> Result<Plan, String> {
         if !stops.contains(&c) {
             stops.push(c);
         }
+    }
+    if let Some(e) = gone() {
+        return e;
     }
     let at = timetables(stops).into_iter().collect();
     Ok(plan(&from, &to, &pairs, &vias, &at))
@@ -529,12 +539,16 @@ fn best(out: &mut Vec<Connection>) {
 /// and the walk on from the last.
 pub type Trip = (i64, i64, Option<Walk>, Option<Walk>);
 
+/// Whether a result is still wanted; a plan stops between its rounds of
+/// requests once it isn't, so ones left behind don't hold up the next.
+pub type Wanted<'a> = &'a (dyn Fn() -> bool + Sync);
+
 /// Plans every trip at once and keeps the best by arrival after the walks.
 /// Fails only if every plan does.
-pub fn fetch_all(trips: &[Trip]) -> Result<Plan, String> {
+pub fn fetch_all(trips: &[Trip], wanted: Wanted) -> Result<Plan, String> {
     let plans: Vec<_> = std::thread::scope(|s| {
         let runs: Vec<_> = (trips.iter())
-            .map(|&(a, b, ..)| s.spawn(move || fetch(a, b)))
+            .map(|&(a, b, ..)| s.spawn(move || fetch(a, b, wanted)))
             .collect();
         runs.into_iter()
             .map(|r| r.join().unwrap_or(Err("panicked".into())))
@@ -750,6 +764,16 @@ mod tests {
         best(&mut out);
         let at: Vec<f64> = out.iter().map(Connection::at).collect();
         assert_eq!(at, [13.0]);
+    }
+
+    #[test]
+    fn plans_no_longer_wanted_ask_nothing() {
+        let t = std::time::Instant::now();
+        assert!(fetch_all(&[(1, 2, None, None)], &|| false).is_err());
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(100),
+            "no request made"
+        );
     }
 
     #[test]
