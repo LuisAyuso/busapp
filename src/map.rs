@@ -154,7 +154,7 @@ pub fn page(h: Handle<Ui>, stops: &[Stop], ui: &Ui, ov: Handle<Overlays>) -> Ele
     let m = map(&city.data)
         .start([0.0, 0.0], START_SCALE)
         .focus(focus.map(|p| (p, FOUND_SCALE)))
-        .on_tap(move |cx, p, _| {
+        .on_tap(move |cx, p| {
             let name = closest_address(&tapped.addresses, p);
             gps::stop();
             cx.update(h, move |u: &mut Ui| {
