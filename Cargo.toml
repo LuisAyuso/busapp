@@ -7,8 +7,8 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-dfui = { path = "../dfui" }
-dfui-map = { path = "../dfui/libs/map" }
+dfui = "0.2.1"
+dfui-map = "0.2.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = "3.5"

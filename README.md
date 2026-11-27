@@ -20,8 +20,8 @@ phone and open it.
 
 ## Development
 
-Expects a [dfui](https://github.com/LuisAyuso/dfui) checkout next to this
-one (`../dfui`).
+Built on the released [dfui](https://github.com/LuisAyuso/dfui) and
+dfui-map crates.
 
 ```sh
 cargo run                    # desktop
@@ -60,7 +60,7 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 Running the workflow by hand (Actions → release → Run workflow) publishes a
-`build-<sha>` release instead. CI checks out dfui's `main` next to this repo.
+`build-<sha>` release instead.
 
 The APK is signed with `~/.android/busapp-release.jks` (password in
 `~/.android/busapp-release.password`), stored in the

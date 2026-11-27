@@ -11,27 +11,14 @@ permissions:
 jobs:
   apk:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: busapp
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: busapp
-
-      # Cargo.toml depends on ../dfui, as on a dev machine.
-      - uses: actions/checkout@v4
-        with:
-          repository: LuisAyuso/dfui
-          path: dfui
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: busapp
 
       - run: cargo test
 
