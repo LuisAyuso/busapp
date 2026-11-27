@@ -7,7 +7,9 @@ use std::sync::OnceLock;
 
 use dfui::path::Stroke;
 use dfui::taffy::{Dimension, Size, Style};
-use dfui::{Color, Element, Event, EventCx, Font, Instant, OnChange, PaintCx, Path, Rect, Widget};
+use dfui::{
+    Color, Element, Event, EventCx, Font, Instant, OnChange, PaintCx, Path, Placer, Rect, Widget,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{ACCENT, INK, MUTED, line_color};
@@ -440,8 +442,7 @@ impl Widget for NetworkView {
             // Busiest stops first, right of the dot or else left of it; a
             // label that would overlap a placed one is left out, so more
             // show as zooming in makes room.
-            // ponytail: O(labels²) overlap test; a grid if it shows up when zoomed out.
-            let mut placed: Vec<Rect> = vec![];
+            let mut placer = Placer::new();
             for &(p, name, selected, _) in &labels {
                 let (font, size, color) = match selected {
                     true => (Font::BOLD, 15.0, INK),
@@ -450,17 +451,7 @@ impl Widget for NetworkView {
                 let t = cx.measure(name, font, size, None);
                 let y = p[1] - t.height / 2.0;
                 let sides = [p[0] + 9.0, p[0] - 9.0 - t.width];
-                let free = sides
-                    .map(|x| Rect::new(x, y, t.width, t.height))
-                    .into_iter()
-                    .find(|at| {
-                        !placed.iter().any(|o| {
-                            let i = o.intersect(at);
-                            i.w > 0.0 && i.h > 0.0
-                        })
-                    });
-                if let Some(at) = free {
-                    placed.push(at);
+                if let Some(at) = placer.place(sides.map(|x| Rect::new(x, y, t.width, t.height))) {
                     cx.text(name, font, size, color, None, (at.x, at.y));
                 }
             }
@@ -520,7 +511,7 @@ impl NetworkView {
                 }
             }
             Event::Cancel | Event::Leave => sim.press = None,
-            Event::Wheel { x, y, dy } => {
+            Event::Wheel { x, y, dy, .. } => {
                 let c = [r.x + r.w / 2.0, r.y + r.h / 2.0];
                 let k = sim.scale(self);
                 let world = sub(mul(sub([x, y], c), 1.0 / k), sim.pan);
